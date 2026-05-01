@@ -582,17 +582,17 @@ class EncoderPipeline:
 # AdaptiveController — per-client fps + bitrate management
 # ---------------------------------------------------------------------------
 class AdaptiveController:
-    _RESPONSIVE_FPS = 20.0   # minimum fps for 50ms input reaction
     _WB_THRESH = 131072      # 128KB asyncio write buffer before we act
 
     def __init__(self, cfg):
         self.fps = float(cfg.max_fps)
         self.max_fps = float(cfg.max_fps)
         self.bitrate = 10_000_000
-        self.jpeg_quality = 65
+        self.jpeg_quality = 85
         self.client_w = 1920
         self.client_h = 1080
-        self._min_br = 200_000
+        self._min_br = 300_000
+        self._min_fps = 5.0          # fps floor — only reduced after bitrate hits minimum
         self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
         self._last_slow = 0.0
         self._last_fast = 0.0
@@ -611,26 +611,32 @@ class AdaptiveController:
             self.client_h = max(1, h)
 
     def _backoff(self, severe):
-        """Reduce quality. Must be called with _lock held; enforces 300ms debounce."""
+        """Reduce quality. Must be called with _lock held; enforces 300ms debounce.
+
+        Priority: cut bitrate (quality) first — preserves fps (input responsiveness).
+        fps is only reduced as a last resort when bitrate is already at the floor,
+        because lower fps means longer frame intervals which increases lag further."""
         now = time.monotonic()
         if now - self._last_slow < 0.3:
             return
         self._last_slow = now
         self._last_fast = 0.0
         factor = 0.5 if severe else 0.75
-        if self.fps > self._RESPONSIVE_FPS:
-            new_fps = max(self._RESPONSIVE_FPS, self.fps * factor)
-            self.bitrate = max(self._min_br, int(self.bitrate * new_fps / self.fps))
-            self.fps = new_fps
-        else:
+        if self.bitrate > self._min_br:
             self.bitrate = max(self._min_br, int(self.bitrate * factor))
-        self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
+            self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
+        elif self.fps > self._min_fps:
+            # Bitrate already floored — reduce fps as last resort
+            self.fps = max(self._min_fps, self.fps * factor)
         log.debug("backoff: fps=%.1f br=%dk severe=%s", self.fps, self.bitrate // 1000, severe)
 
     def on_lag(self, age_ms, write_buf=0):
-        if age_ms < 100 and write_buf < self._WB_THRESH:
+        # 50ms tolerance = expected 1-frame-in-buffer baseline on any link.
+        # Use metric_rtt as the dynamic baseline when available.
+        baseline = (self._metric_rtt + 50) if self._metric_rtt > 0 else 150
+        if age_ms < baseline and write_buf < self._WB_THRESH:
             return
-        severe = age_ms > 500 or write_buf > 524288
+        severe = age_ms > baseline * 3 or write_buf > 524288
         with self._lock:
             self._backoff(severe)
 
@@ -665,9 +671,10 @@ class AdaptiveController:
                     log.debug("ping gradient=%.1fms rtt=%.1fms", gradient, s)
 
             # Signal 2: delta — buffer STATIC (only when gradient hasn't already fired)
+            # 50ms tolerance = expected 1-frame-in-buffer offset; anything above is real queuing.
             if not gradient_fired and self._metric_rtt > 0:
                 delta = s - self._metric_rtt
-                if delta > 40:
+                if delta > 50:
                     self._backoff(delta > 150)
                     log.debug("ping delta=%.1fms rtt=%.1fms metric=%.1fms", delta, s, self._metric_rtt)
 
@@ -687,10 +694,18 @@ class AdaptiveController:
                 return
             self._last_fast = now
             if self.fps < self.max_fps:
-                self.fps = self.max_fps   # jump to max; congestion signals back off if needed
+                self.fps = self.max_fps   # restore fps to max first
             elif self.bitrate < self._max_br:
-                self.bitrate = min(self._max_br, int(self.bitrate * 1.10))
-                self.jpeg_quality = min(95, self.jpeg_quality + 2)
+                # Tiered probe: fast ramp at low bitrates, slower near the ceiling.
+                # Congestion signals will backtrack immediately if the link can't keep up.
+                if self.bitrate < 5_000_000:
+                    factor = 1.5
+                elif self.bitrate < 20_000_000:
+                    factor = 1.25
+                else:
+                    factor = 1.10
+                self.bitrate = min(self._max_br, int(self.bitrate * factor))
+                self.jpeg_quality = min(95, self.jpeg_quality + 5)
             log.debug("fresh: fps=%.1f br=%dk", self.fps, self.bitrate // 1000)
 
     def on_screen_active(self):
