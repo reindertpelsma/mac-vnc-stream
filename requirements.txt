@@ -2,4 +2,5 @@ websockets>=13.0
 numpy>=1.24
 Pillow>=10.0
 cryptography>=41.0
-PyTurboJPEG>=1.7.0   # optional but recommended — ~2x faster JPEG encoding
+av>=12.0              # PyAV: H.264/H.265 via VideoToolbox — strongly recommended
+PyTurboJPEG>=1.7.0   # optional: faster JPEG when av unavailable
