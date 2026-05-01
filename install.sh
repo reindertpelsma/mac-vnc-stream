@@ -25,7 +25,7 @@ fi
 
 # Install Python dependencies
 echo "==> Installing Python packages..."
-python3 -m pip install --upgrade websockets numpy Pillow cryptography PyTurboJPEG
+python3 -m pip install --upgrade websockets numpy Pillow cryptography av PyTurboJPEG
 
 echo ""
 echo "==> Done! Run the server with:"
