@@ -594,6 +594,7 @@ class AdaptiveController:
         self._min_br = 300_000
         self._min_fps = 5.0          # fps floor — only reduced after bitrate hits minimum
         self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
+        self._peak_bitrate = self.bitrate  # highest stable bitrate seen — target on wakeup
         self._last_slow = 0.0
         self._last_fast = 0.0
         self._lock = threading.Lock()
@@ -692,12 +693,14 @@ class AdaptiveController:
             now = time.monotonic()
             if now - self._last_fast < 2.0:
                 return
+            if now - self._last_slow < 2.0:
+                return  # recent backoff — wait for stability before probing up
             self._last_fast = now
             if self.fps < self.max_fps:
-                self.fps = self.max_fps   # restore fps to max first
+                self.fps = self.max_fps
             elif self.bitrate < self._max_br:
-                # Tiered probe: fast ramp at low bitrates, slower near the ceiling.
-                # Congestion signals will backtrack immediately if the link can't keep up.
+                # Current bitrate is stable — record as peak before probing higher
+                self._peak_bitrate = max(self._peak_bitrate, self.bitrate)
                 if self.bitrate < 5_000_000:
                     factor = 1.5
                 elif self.bitrate < 20_000_000:
@@ -706,14 +709,18 @@ class AdaptiveController:
                     factor = 1.10
                 self.bitrate = min(self._max_br, int(self.bitrate * factor))
                 self.jpeg_quality = min(95, self.jpeg_quality + 5)
-            log.debug("fresh: fps=%.1f br=%dk", self.fps, self.bitrate // 1000)
+            log.debug("fresh: fps=%.1f br=%dk peak=%dk", self.fps, self.bitrate//1000, self._peak_bitrate//1000)
 
     def on_screen_active(self):
-        """Screen content changed after a static period — reset fps to max immediately."""
+        """Screen content changed after a static period — reset to last known stable state.
+        Jumps directly to peak bitrate so we don't spend 20s ramping from the post-backoff floor."""
         with self._lock:
             self.fps = self.max_fps
+            if self._peak_bitrate > self.bitrate:
+                self.bitrate = self._peak_bitrate
+                self.jpeg_quality = min(95, self.jpeg_quality + 20)
             self._last_fast = time.monotonic()
-            log.debug("screen active: fps=%.1f", self.fps)
+            log.debug("screen active: fps=%.1f br=%dk peak=%dk", self.fps, self.bitrate//1000, self._peak_bitrate//1000)
 
     def snapshot(self):
         with self._lock:
@@ -755,10 +762,7 @@ async def client_session(ws, cfg, bridge):
     has_webcodecs = False
 
     seq_num = 0
-    last_fb_seq = 0
     last_send_time = time.monotonic()
-    lag_history = []        # recent age_ms values from client
-    no_lag_since = time.monotonic()
 
     def _upgrade_encoder():
         nonlocal encoder, has_webcodecs
@@ -793,7 +797,7 @@ async def client_session(ws, cfg, bridge):
     loop = asyncio.get_event_loop()
 
     async def input_reader():
-        nonlocal has_webcodecs, no_lag_since, target_codec
+        nonlocal has_webcodecs, target_codec
         cur_buttons = 0
         try:
             async for raw in ws:
@@ -821,14 +825,11 @@ async def client_session(ws, cfg, bridge):
                         ctrl.on_resolution(int(ev.get("w",1920)), int(ev.get("h",1080)))
                     elif t == "lag":
                         age = float(ev.get("age_ms", 0))
-                        wb = _get_wbuf(ws)
-                        ctrl.on_lag(age, wb)
-                        no_lag_since = 0.0
+                        ctrl.on_lag(age, _get_wbuf(ws))
                     elif t == "metric_rtt":
                         ctrl.on_metric_rtt(float(ev.get("rtt_ms", 0)))
                     elif t == "fresh":
-                        if no_lag_since == 0.0:
-                            no_lag_since = time.monotonic()
+                        ctrl.on_fresh()  # JS confirms no lag — same gate as frame_sender probe
                     elif t == "mm":
                         bridge.send_pointer(cur_buttons, int(ev["x"]), int(ev["y"]))
                     elif t == "md":
@@ -878,7 +879,7 @@ async def client_session(ws, cfg, bridge):
             bridge.send_key_reset()
 
     async def frame_sender():
-        nonlocal seq_num, last_fb_seq, last_send_time, no_lag_since
+        nonlocal seq_num, last_send_time
         known_clip = bridge.server_clipboard_seq
         last_encoder_codec = encoder.actual_codec
         _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
@@ -915,14 +916,16 @@ async def client_session(ws, cfg, bridge):
                         except Exception: pass
                         _pipe_task = None
 
-                # Write buffer check — immediate local backpressure
+                # Write buffer check — immediate local backpressure.
+                # Threshold is 32KB (not 0) so a single large frame still draining
+                # doesn't cause immediate drops on fast links.
                 wb = _get_wbuf(ws)
                 if wb > 4 * 1024 * 1024:
                     log.warning("write buf %.1fMB — hard kill %s", wb / 1048576, ws.remote_address)
                     try: await ws.close()
                     except Exception: pass
                     break
-                if wb > 0:
+                if wb > 32 * 1024:
                     ctrl.on_lag(0, wb)
                     _n_drop += 1
                     if _pipe_task is not None:
@@ -962,16 +965,14 @@ async def client_session(ws, cfg, bridge):
                     await asyncio.sleep(min(interval, 1.0 / 60.0))
                     continue
 
-                # Screen just changed after a static period — reset fps to max immediately
-                # so P-frames flow at full rate without waiting for the slow fresh-ramp.
+                # Screen just changed after a static period — jump to peak bitrate immediately
                 if _was_static:
                     _was_static = False
                     ctrl.on_screen_active()
                     last_send_time = time.monotonic() - interval  # skip rate-limit delay
 
-                # Fresh streak → try to speed up
-                if no_lag_since > 0 and (now - no_lag_since) > 2.0:
-                    ctrl.on_fresh()
+                # Probe quality up — gated internally on _last_slow (no recent backoff)
+                ctrl.on_fresh()
 
                 # Pipeline: start encode NOW so it runs concurrently with the rate-limit sleep.
                 # Encode takes ~4.5ms; sleep is ~16.7ms — encode finishes well before we wake.
@@ -990,7 +991,7 @@ async def client_session(ws, cfg, bridge):
                 if to_sleep > 0.001:
                     await asyncio.sleep(to_sleep)
                     wb = _get_wbuf(ws)
-                    if wb > 0:
+                    if wb > 32 * 1024:
                         ctrl.on_lag(0, wb)
                         _n_drop += 1
                         if _pipe_task is not None:
@@ -1026,7 +1027,7 @@ async def client_session(ws, cfg, bridge):
                     last_send_time = target
                     continue
 
-                if _get_wbuf(ws) > 0:
+                if _get_wbuf(ws) > 32 * 1024:
                     ctrl.on_lag(0, _get_wbuf(ws))
                     _n_drop += 1
                     continue
