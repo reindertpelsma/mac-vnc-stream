@@ -565,8 +565,9 @@ class AdaptiveController:
         self._last_slow = 0.0
         self._last_fast = 0.0
         self._lock = threading.Lock()
-        self._ping_samples = []     # initial RTT samples for baseline
-        self._ping_baseline = 0.0   # EWA baseline RTT in ms; 0 = not yet established
+        self._ping_samples = []     # initial samples for fallback baseline
+        self._ping_baseline = 0.0   # fallback EWA baseline (used before metric WS connects)
+        self._metric_rtt = 0.0      # EWA of unloaded metric-channel RTT; 0 = not measured yet
 
     @property
     def frame_interval(self):
@@ -602,20 +603,36 @@ class AdaptiveController:
             self._backoff(severe)
 
     def on_ping_rtt(self, rtt_ms):
-        """WebSocket ping RTT as third congestion signal. Ping queues behind video
-        frames, so rising RTT means the send buffer is forming before TCP notices."""
+        """Video-channel RTT. Ping queues behind video frames so RTT includes queuing delay.
+        When metric RTT is known: congestion = video_rtt - metric_rtt > threshold (link-agnostic).
+        When metric channel not yet connected: fall back to baseline comparison."""
         with self._lock:
-            if self._ping_baseline == 0.0:
-                self._ping_samples.append(rtt_ms)
-                if len(self._ping_samples) >= 5:
-                    self._ping_baseline = sum(self._ping_samples) / len(self._ping_samples)
-                return
-            threshold = self._ping_baseline * 2.5 + 40
-            if rtt_ms > threshold:
-                self._backoff(rtt_ms > threshold * 2)
+            if self._metric_rtt > 0:
+                # delta isolates queuing delay from link latency — valid across roaming/jitter
+                delta = rtt_ms - self._metric_rtt
+                if delta > 40:
+                    self._backoff(delta > 150)
             else:
-                # Slowly decay baseline toward current RTT
-                self._ping_baseline = self._ping_baseline * 0.9 + rtt_ms * 0.1
+                # Metric channel not yet up — baseline fallback
+                if self._ping_baseline == 0.0:
+                    self._ping_samples.append(rtt_ms)
+                    if len(self._ping_samples) >= 5:
+                        self._ping_baseline = sum(self._ping_samples) / len(self._ping_samples)
+                    return
+                threshold = self._ping_baseline * 2.5 + 40
+                if rtt_ms > threshold:
+                    self._backoff(rtt_ms > threshold * 2)
+                else:
+                    self._ping_baseline = self._ping_baseline * 0.9 + rtt_ms * 0.1
+
+    def on_metric_rtt(self, rtt_ms):
+        """RTT on the unloaded metric channel — pure link latency, no video queuing.
+        Fast EWA (0.7/0.3) so link changes from WiFi↔5G roaming are reflected in ~4s."""
+        with self._lock:
+            if self._metric_rtt == 0.0:
+                self._metric_rtt = rtt_ms
+            else:
+                self._metric_rtt = self._metric_rtt * 0.7 + rtt_ms * 0.3
 
     def on_fresh(self):
         with self._lock:
@@ -741,6 +758,8 @@ async def client_session(ws, cfg, bridge):
                         wb = _get_wbuf(ws)
                         ctrl.on_lag(age, wb)
                         no_lag_since = 0.0
+                    elif t == "metric_rtt":
+                        ctrl.on_metric_rtt(float(ev.get("rtt_ms", 0)))
                     elif t == "fresh":
                         if no_lag_since == 0.0:
                             no_lag_since = time.monotonic()
@@ -1174,7 +1193,8 @@ function updateFps(){
     const bw=rxBps>=1e6?(rxBps/1e6).toFixed(1)+'Mbps':(rxBps/1e3).toFixed(0)+'Kbps';
     const lag=worstAge5s>0?'lag:'+worstAge5s+'ms ':'';
     const codec=codecName?codecName+' ':'';
-    hud.textContent=fc+'fps '+codec+bw+' '+lag+imgW+'×'+imgH;
+    const net=metricRtt>0?'net:'+metricRtt+'ms ':'';
+    hud.textContent=fc+'fps '+codec+bw+' '+lag+net+imgW+'×'+imgH;
     fc=0;lastFpsT=now;
   }
 }
@@ -1236,6 +1256,39 @@ function connect(){
     }
   };
 }
+
+// ---------------------------------------------------------------------------
+// Metric WebSocket — unloaded channel; echoes pings so client measures baseline RTT.
+// video_ping_rtt - metric_rtt = pure queuing delay, independent of link latency/roaming.
+// ---------------------------------------------------------------------------
+let metricWs=null,metricOpen=false,metricRtt=0;
+
+function connectMetric(){
+  const token=new URLSearchParams(location.search).get('token')||'';
+  const url='ws://'+location.host+'/metric'+(token?'?token='+encodeURIComponent(token):'');
+  metricWs=new WebSocket(url);
+  metricWs.onopen=()=>{
+    metricOpen=true;
+    // Send first ping immediately so metric RTT is known before the video channel needs it
+    sendMetricPing();
+  };
+  metricWs.onclose=()=>{metricOpen=false;setTimeout(connectMetric,1000);};
+  metricWs.onerror=()=>{};
+  metricWs.onmessage=e=>{
+    try{
+      const msg=JSON.parse(e.data);
+      if(msg.t==='ping'&&msg.ts){
+        metricRtt=Date.now()-msg.ts;
+        // Report to video channel — server uses this as the unloaded RTT reference
+        send({t:'metric_rtt',rtt_ms:metricRtt});
+      }
+    }catch(e){}
+  };
+}
+function sendMetricPing(){
+  if(metricOpen&&metricWs)metricWs.send(JSON.stringify({t:'ping',ts:Date.now()}));
+}
+setInterval(sendMetricPing,2000);
 
 // ---------------------------------------------------------------------------
 // Mouse
@@ -1326,7 +1379,7 @@ document.addEventListener('visibilitychange',()=>{
 window.addEventListener('blur',()=>{
   if(wsOpen)send({t:'reset'});
 });
-canvas.width=imgW;canvas.height=imgH;resize();connect();
+canvas.width=imgW;canvas.height=imgH;resize();connect();connectMetric();
 </script></body></html>
 """
 HTML_BYTES = HTML.encode("utf-8")
@@ -1376,12 +1429,29 @@ def make_http_handler(cfg, bridge):
             return Response(200, "OK", hdrs, HTML_BYTES)
     return handler
 
+async def metric_session(ws):
+    """Unloaded ping channel — echoes JSON messages immediately, no video data.
+    Client sends {t:'ping',ts:N}, measures round-trip, reports delta to video WS."""
+    try:
+        async for msg in ws:
+            if isinstance(msg, str):
+                try:
+                    await ws.send(msg)
+                except Exception:
+                    break
+    except Exception:
+        pass
+
 def make_ws_handler(cfg, bridge):
     async def handler(ws):
-        if not _check_token(ws.request.path if hasattr(ws,'request') else "/", cfg.password):
+        path = (ws.request.path if hasattr(ws, 'request') else "/").split("?")[0]
+        if not _check_token(ws.request.path if hasattr(ws, 'request') else "/", cfg.password):
             await ws.close(1008, "Forbidden")
             return
-        await client_session(ws, cfg, bridge)
+        if path == "/metric":
+            await metric_session(ws)
+        else:
+            await client_session(ws, cfg, bridge)
     return handler
 
 # ---------------------------------------------------------------------------
