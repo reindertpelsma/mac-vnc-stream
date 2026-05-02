@@ -244,6 +244,81 @@ KEYSYM = {
     "CapsLock":0xFFE5," ":0x0020,
 }
 
+# Mac virtual key codes indexed by browser e.code.
+# Allows CGEvent injection to bypass screensharingd's X11 keysym→VK translation,
+# which becomes unreliable after VNC reconnects on newer macOS versions.
+VK = {
+    "KeyA":0,"KeyB":11,"KeyC":8,"KeyD":2,"KeyE":14,"KeyF":3,"KeyG":5,"KeyH":4,
+    "KeyI":34,"KeyJ":38,"KeyK":40,"KeyL":37,"KeyM":46,"KeyN":45,"KeyO":31,"KeyP":35,
+    "KeyQ":12,"KeyR":15,"KeyS":1,"KeyT":17,"KeyU":32,"KeyV":9,"KeyW":13,"KeyX":7,
+    "KeyY":16,"KeyZ":6,
+    "Digit0":29,"Digit1":18,"Digit2":19,"Digit3":20,"Digit4":21,
+    "Digit5":23,"Digit6":22,"Digit7":26,"Digit8":28,"Digit9":25,
+    "Space":49,"Enter":36,"Return":36,"Tab":48,"Backspace":51,"Delete":117,
+    "Escape":53,"Home":115,"End":119,"PageUp":116,"PageDown":121,
+    "ArrowLeft":123,"ArrowRight":124,"ArrowUp":126,"ArrowDown":125,
+    "Equal":24,"Minus":27,"BracketLeft":33,"BracketRight":30,
+    "Backslash":42,"Semicolon":41,"Quote":39,"Comma":43,"Period":47,"Slash":44,"Backquote":50,
+    "MetaLeft":55,"MetaRight":54,
+    "ShiftLeft":56,"ShiftRight":60,
+    "ControlLeft":59,"ControlRight":62,
+    "AltLeft":58,"AltRight":61,
+    "CapsLock":57,
+    "F1":122,"F2":120,"F3":99,"F4":118,"F5":96,"F6":97,
+    "F7":98,"F8":100,"F9":101,"F10":109,"F11":103,"F12":111,
+}
+# e.key aliases: browser sends lowercase letter as k ("a") and code as "KeyA".
+# Add both so CGEvent handles the letter without falling back to VNC.
+for _c in "abcdefghijklmnopqrstuvwxyz":
+    VK[_c] = VK[f"Key{_c.upper()}"]
+    VK[_c.upper()] = VK[f"Key{_c.upper()}"]
+for _d in "0123456789":
+    VK[_d] = VK[f"Digit{_d}"]
+VK[" "] = 49   # e.key for Space is " "
+del _c, _d
+# kCGEventFlag masks for each modifier VK code
+_VK_FLAGS = {
+    55:0x100000, 54:0x100000,  # MetaLeft/Right → Command
+    56:0x020000, 60:0x020000,  # ShiftLeft/Right → Shift
+    59:0x040000, 62:0x040000,  # ControlLeft/Right → Control
+    58:0x080000, 61:0x080000,  # AltLeft/Right → Option
+    57:0x010000,               # CapsLock → AlphaShift
+}
+_VK_MODS = frozenset(_VK_FLAGS)
+# Global modifier-held state for CGEvent path (system-global, not per-session).
+_cg_mod_held: set = set()
+# True once AXIsProcessTrusted() and a test CGEventPost both succeed.
+_cg_kb_ok: bool = False
+
+def _check_cg_kb() -> bool:
+    """Probe Accessibility permission and enable CGEvent keyboard injection if granted."""
+    global _cg_kb_ok
+    if _cg_kb_ok:
+        return True
+    try:
+        import ctypes, Quartz as _Q
+        ax = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        ax.AXIsProcessTrusted.restype = ctypes.c_bool
+        if not ax.AXIsProcessTrusted():
+            return False
+        # Confirm CGEventPost works: post a key-up for a non-existent VK (no-op).
+        evt = _Q.CGEventCreateKeyboardEvent(None, 0xFF, False)
+        _Q.CGEventPost(_Q.kCGHIDEventTap, evt)
+        _cg_kb_ok = True
+        log.info("CGEvent keyboard: Accessibility granted — CGEvent input active")
+        return True
+    except Exception as e:
+        log.debug("CGEvent keyboard probe: %s", e)
+        return False
+
+def _poll_cg_kb():
+    """Background thread: poll until Accessibility is granted, then enable CGEvent input."""
+    import time
+    while not _cg_kb_ok:
+        time.sleep(5)
+        _check_cg_kb()
+
 def _recv(sock, n):
     buf = bytearray()
     while len(buf) < n:
@@ -570,11 +645,20 @@ class VNCBridge:
                 _last_change_ms = _last_req_ms  # last time pixels actually changed
                 _last_keepalive_ms = _last_req_ms
                 _keepalive_idx  = 0
+                _connect_ms     = _last_req_ms
+                _force_reconnect = False
                 while True:
                     self._flush_input()
                     r, _, _ = select.select([s], [], [], 0.005)  # 5ms: lower key-event pickup latency
                     if not r:
                         now_ms   = int(time.time() * 1000)
+                        # screensharingd silently stops processing VNC input events
+                        # after ~10 min while keeping the socket open — detect via age
+                        # and force a clean reconnect before that window expires.
+                        if now_ms - _connect_ms > 8 * 60 * 1000:
+                            log.info("VNC: periodic reconnect to prevent screensharingd input stall")
+                            _force_reconnect = True
+                            break
                         stale_ms = now_ms - _last_fbu_ms
                         if not _pending_req:
                             # Use content staleness (time since last pixel change) not FBU
@@ -704,7 +788,9 @@ class VNCBridge:
             except Exception as e:
                 log.warning("VNC error: %s — retry in 3s", e)
                 self._sock = None
-            time.sleep(3)
+                _force_reconnect = False
+            if not _force_reconnect:
+                time.sleep(3)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -1526,8 +1612,31 @@ async def client_session(ws, cfg, bridge):
                         asyncio.create_task(_scroll())
                     elif t in ("kd","ku"):
                         k = ev.get("k",""); code = ev.get("code","")
-                        ks = KEYSYM.get(code) or KEYSYM.get(k) or (ord(k) if len(k)==1 else None)
-                        if ks: bridge.send_key(t=="kd", ks)
+                        down = t == "kd"
+                        vk = VK.get(code) if code else None
+                        if vk is None and k:
+                            vk = VK.get(k)
+                        if vk is not None and _cg_kb_ok:
+                            # CGEvent primary path — native VK codes, bypasses screensharingd
+                            # keysym→VK translation which changes after VNC reconnects.
+                            if vk in _VK_MODS:
+                                if down: _cg_mod_held.add(vk)
+                                else:    _cg_mod_held.discard(vk)
+                            flags = 0
+                            for mv in _cg_mod_held:
+                                flags |= _VK_FLAGS.get(mv, 0)
+                            try:
+                                import Quartz as _Q
+                                evt = _Q.CGEventCreateKeyboardEvent(None, vk, down)
+                                _Q.CGEventSetFlags(evt, flags)
+                                _Q.CGEventPost(_Q.kCGHIDEventTap, evt)
+                            except Exception as _e:
+                                log.debug("CGEvent key vk=%d: %s — VNC fallback", vk, _e)
+                                ks = KEYSYM.get(code) or KEYSYM.get(k) or (ord(k) if len(k)==1 else None)
+                                if ks: bridge.send_key(down, ks)
+                        else:
+                            ks = KEYSYM.get(code) or KEYSYM.get(k) or (ord(k) if len(k)==1 else None)
+                            if ks: bridge.send_key(down, ks)
                     elif t in ("paste", "setclip"):
                         text = ev.get("text","")
                         if text:
@@ -1543,15 +1652,31 @@ async def client_session(ws, cfg, bridge):
                                 bridge.send_clipboard(text)  # fallback
                         if t == "paste" and text:
                             # Release any held modifiers, then send Cmd+V
-                            for ks in [KEYSYM["ShiftLeft"], KEYSYM["ShiftRight"],
-                                       KEYSYM["Control"], KEYSYM["ControlRight"],
-                                       KEYSYM["Alt"], KEYSYM["AltRight"],
-                                       KEYSYM["MetaLeft"], KEYSYM["MetaRight"]]:
-                                bridge.send_key(False, ks)
-                            bridge.send_key(True,  KEYSYM["MetaLeft"])
-                            bridge.send_key(True,  0x76)
-                            bridge.send_key(False, 0x76)
-                            bridge.send_key(False, KEYSYM["MetaLeft"])
+                            if _cg_kb_ok:
+                                try:
+                                    import Quartz as _Q
+                                    _cg_mod_held.clear()
+                                    for _vk, _dn, _fl in [
+                                        (55, True,  0x100000),
+                                        (9,  True,  0x100000),
+                                        (9,  False, 0x100000),
+                                        (55, False, 0),
+                                    ]:
+                                        _e2 = _Q.CGEventCreateKeyboardEvent(None, _vk, _dn)
+                                        _Q.CGEventSetFlags(_e2, _fl)
+                                        _Q.CGEventPost(_Q.kCGHIDEventTap, _e2)
+                                except Exception:
+                                    pass
+                            else:
+                                for ks in [KEYSYM["ShiftLeft"], KEYSYM["ShiftRight"],
+                                           KEYSYM["Control"], KEYSYM["ControlRight"],
+                                           KEYSYM["Alt"], KEYSYM["AltRight"],
+                                           KEYSYM["MetaLeft"], KEYSYM["MetaRight"]]:
+                                    bridge.send_key(False, ks)
+                                bridge.send_key(True,  KEYSYM["MetaLeft"])
+                                bridge.send_key(True,  0x76)
+                                bridge.send_key(False, 0x76)
+                                bridge.send_key(False, KEYSYM["MetaLeft"])
                     elif t == "dbg_result":
                         log.info("DBG[%s]: %s", ev.get("id","?"), ev.get("result",""))
                 except Exception:
@@ -2854,6 +2979,10 @@ def main():
     _request_screen_capture_access()
     _request_accessibility()
     _start_compositor_keepalive()
+    if not _check_cg_kb():
+        log.warning("CGEvent keyboard: Accessibility not granted — using VNC keysym fallback. "
+                    "Enable in System Settings > Privacy > Accessibility.")
+        threading.Thread(target=_poll_cg_kb, daemon=True).start()
     ds = None
     # Try in-process SCK first: avoids subprocess permission/session issues on macOS 26.
     ip = InProcessSCKBridge()
