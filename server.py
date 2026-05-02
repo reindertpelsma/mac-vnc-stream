@@ -476,6 +476,7 @@ class VNCBridge:
     def _connect(self):
         cfg = self._cfg
         s = socket.socket()
+        s.settimeout(10)  # screensharingd can hang after SCK restarts; detect fast
         s.connect((cfg.vnc_host, cfg.vnc_port))
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         _recv(s, 12); s.send(b"RFB 003.008\n")
@@ -496,6 +497,7 @@ class VNCBridge:
         else:
             s.close(); raise ConnectionError("No supported auth type, server offers: %s" % types)
         s.send(b"\x01")
+        s.settimeout(None)  # switch to blocking for the frame receive loop
         return s
 
     def _cg_direct_capture(self, W, H):
