@@ -289,6 +289,27 @@ _VK_MODS = frozenset(_VK_FLAGS)
 _cg_mod_held: set = set()
 # True once AXIsProcessTrusted() and a test CGEventPost both succeed.
 _cg_kb_ok: bool = False
+_active_clients: int = 0   # live WebSocket sessions; capture loops idle when 0
+
+def _cg_release_all() -> None:
+    """Release all CGEvent modifier keys and mouse buttons. Called on client disconnect."""
+    global _cg_mod_held, _cg_mouse_prev_btn
+    try:
+        import Quartz as _Q
+        for vk in list(_cg_mod_held):
+            evt = _Q.CGEventCreateKeyboardEvent(None, vk, False)
+            _Q.CGEventSetFlags(evt, 0)
+            _Q.CGEventPost(_Q.kCGHIDEventTap, evt)
+        _cg_mod_held.clear()
+        if _cg_mouse_prev_btn:
+            pt = _Q.CGPoint(0, 0)
+            for mask, _, up_name, btn_name in _CG_BTNS:
+                if _cg_mouse_prev_btn & mask:
+                    _Q.CGEventPost(_Q.kCGHIDEventTap,
+                                   _Q.CGEventCreateMouseEvent(None, getattr(_Q, up_name), pt, getattr(_Q, btn_name)))
+            _cg_mouse_prev_btn = 0
+    except Exception:
+        pass
 
 def _check_cg_kb() -> bool:
     """Probe Accessibility permission and enable CGEvent keyboard injection if granted."""
@@ -726,6 +747,10 @@ class VNCBridge:
                 _connect_ms     = _last_req_ms
                 _force_reconnect = False
                 while True:
+                    if _active_clients == 0:
+                        time.sleep(0.2)  # no viewers — stop polling screensharingd to save CPU/battery
+                        self._flush_input()
+                        continue
                     self._flush_input()
                     r, _, _ = select.select([s], [], [], 0.005)  # 5ms: lower key-event pickup latency
                     if not r:
@@ -1138,6 +1163,8 @@ class InProcessSCKBridge:
                 if bridge is None:
                     return
                 try:
+                    if _active_clients == 0:
+                        return  # no viewers — skip frame processing to save CPU/battery
                     sb_ptr = _sb_to_ptr(sampleBuffer)
                     if not sb_ptr:
                         return
@@ -1924,7 +1951,8 @@ async def client_session(ws, cfg, bridge):
             pass
         finally:
             cur_buttons = 0
-            bridge.send_key_reset()
+            bridge.send_key_reset()  # VNC path: release all modifier keys + mouse buttons
+            _cg_release_all()        # CGEvent path: release modifiers + mouse buttons
 
     async def frame_sender():
         nonlocal seq_num, last_send_time
@@ -2184,9 +2212,12 @@ async def client_session(ws, cfg, bridge):
                 log.debug("ping err: %s", e)
                 break
 
+    global _active_clients
+    _active_clients += 1
     try:
         await asyncio.gather(frame_sender(), input_reader(), dbg_sender(), ping_monitor())
     finally:
+        _active_clients -= 1
         _dbg_eval_sessions.discard(dbg_q)
     log.info("client disconnect: %s", ws.remote_address)
 
@@ -2329,6 +2360,7 @@ const st=document.getElementById('st'),ki=document.getElementById('ki');
 let imgW=1920,imgH=1080,scaleX=1,scaleY=1,ox=0,oy=0;
 let _nativeW=1920,_nativeH=1080; // Mac's true capture resolution — used for mouse coordinate mapping
 let ws,wsOpen=false,mBtn=0,fc=0,lastFpsT=performance.now();
+let _lastAnyData=Date.now(); // updated on every WS message; stall-detect uses this
 let clipSynced=false;       // true only when navigator.clipboard.readText() permission is persistently granted
 let _lastMacClipboard='';   // last clipboard text known on Mac side; used to break browser↔Mac sync loop
 let _clipPollTimer=null;    // setInterval handle for browser-clipboard polling
@@ -2584,7 +2616,7 @@ function connect(){
   ws=new WebSocket(url);
   ws.binaryType='arraybuffer';
   ws.onopen=()=>{
-    wsOpen=true;
+    wsOpen=true;_lastAnyData=Date.now();
     send({t:'reset'});  // release any stuck keys/buttons from previous session
     st.textContent='connected';
     startLagReporter();
@@ -2616,6 +2648,7 @@ function connect(){
   };
   ws.onerror=()=>{};
   ws.onmessage=e=>{
+    _lastAnyData=Date.now();
     if(e.data instanceof ArrayBuffer){
       handleBinary(e.data);
     }else{
@@ -2682,6 +2715,14 @@ function sendMetricPing(){
   if(metricOpen&&metricWs)metricWs.send(JSON.stringify({t:'ping',ts:Date.now()}));
 }
 setInterval(sendMetricPing,2000);
+// Stall detector: server sends a heartbeat every 2s even on a static screen.
+// If we receive nothing for 15s the connection is silently dead — force reconnect.
+setInterval(()=>{
+  if(wsOpen&&Date.now()-_lastAnyData>15000){
+    console.warn('Stream stalled — reconnecting');
+    try{ws.close();}catch(e){}
+  }
+},5000);
 
 // ---------------------------------------------------------------------------
 // Mouse
