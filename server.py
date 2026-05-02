@@ -6,7 +6,7 @@ python server.py --vnc-pass PASSWORD
 python server.py --macos-user u --macos-pass p  # full control (macOS 15+)
 ssh -L 6081:localhost:6081 user@mac && open http://localhost:6081
 """
-import argparse, asyncio, hashlib, json, logging, os, select, socket, struct
+import argparse, asyncio, hashlib, json, logging, os, select, socket, struct, sys
 import threading, time, zlib
 from io import BytesIO
 import numpy as np
@@ -225,10 +225,14 @@ class VNCBridge:
         self._fbu_count = 0   # VNC FramebufferUpdates with actual pixels received
         self._last_ptr_x = 0
         self._last_ptr_y = 0
-        self._hover_after_ms = 0  # schedule a delayed nudge at this epoch-ms
+        self._nudge_schedule = []  # [(epoch_ms, x, y), ...] — scheduled compositor-wake nudges
         self._cached_fb = None    # copy made at last _fb_seq change
         self._cached_seq = -1     # seq corresponding to _cached_fb
         self._fb_hash = 0         # content hash for static-screen detection
+        self._last_key_ms = 0     # epoch_ms of last keydown sent to Mac
+        self._cg_fb = None           # CGImage override buffer (RGB, same shape as _fb)
+        self._cg_override_until = 0  # epoch_ms: suppress stale VNC overwrites until this time
+        self._stale_vnc_hash = 0     # hash screensharingd returned when CGImage capture was done
 
     @property
     def dimensions(self):
@@ -265,18 +269,40 @@ class VNCBridge:
     def send_key(self, down, keysym):
         with self._lock:
             self._input_q.append(struct.pack("!BBxxI", 4, int(down), keysym))
-            if not down:
-                # screensharingd batches damage and only flushes on pointer events.
-                # Immediate nudge to x+1 triggers first damage scan; the 30ms delayed
-                # nudge returns to x (two distinct movement events, maximising coverage
-                # of fast renders AND slower terminal async renders).
-                lx, ly = self._last_ptr_x, self._last_ptr_y
+            lx, ly = self._last_ptr_x, self._last_ptr_y
+            if down:
                 self._input_q.append(struct.pack("!BBHH", 5, 0, lx + 1, ly))
-                self._hover_after_ms = int(time.time() * 1000) + 30
+                now_ms = int(time.time() * 1000)
+                self._last_key_ms = now_ms
+                self._nudge_schedule = [
+                    (now_ms + i * 30, lx + (i % 2), ly) for i in range(1, 21)
+                ]
+            else:
+                self._input_q.append(struct.pack("!BBHH", 5, 0, lx, ly))
+        # Post a real HID-level event so screensharingd exits HID-idle immediately.
+        # kCGSessionEventTap (what VNC injection uses) is invisible to screensharingd's
+        # own HID-idle detector — only kCGHIDEventTap wakes it. Requires Accessibility
+        # permission or root; falls back silently if unavailable.
+        if down:
+            try:
+                import Quartz as _Q
+                import AppKit as _AK
+                mp = _AK.NSEvent.mouseLocation()
+                sh = _AK.NSScreen.mainScreen().frame().size.height
+                e = _Q.CGEventCreateMouseEvent(
+                    None, _Q.kCGEventMouseMoved,
+                    _Q.CGPoint(mp.x + 1, sh - mp.y), _Q.kCGMouseButtonLeft)
+                _Q.CGEventPost(_Q.kCGHIDEventTap, e)
+            except Exception:
+                pass
 
     def send_clipboard(self, text):
+        # Encode inline into _input_q so it's sent before subsequent key events.
+        # _clip_q is flushed AFTER _input_q in _flush_input, which would cause
+        # Cmd+V to fire before the clipboard is set — pasting the old content.
+        enc = text.encode("latin-1", errors="replace")
         with self._lock:
-            self._clip_q.append(text)
+            self._input_q.append(struct.pack("!BBxxI", 6, 0, len(enc)) + enc)
 
     def send_key_reset(self):
         """Release modifier keys and clear mouse buttons — guards against stuck state on reconnect."""
@@ -328,6 +354,45 @@ class VNCBridge:
         s.send(b"\x01")
         return s
 
+    def _cg_direct_capture(self, W, H):
+        """Capture the live screen via screencapture, bypassing screensharingd.
+        Called when screensharingd is HID-idle. Takes ~150-250ms on M1.
+        Uses the system screencapture tool which always returns the correctly
+        composited scene (all windows + wallpaper, no premultiplied-alpha garbage)."""
+        import subprocess, os, tempfile
+        from PIL import Image as _PIL
+        fname = None
+        try:
+            fd, fname = tempfile.mkstemp(suffix='.png', prefix='vnc_cap_', dir='/tmp')
+            os.close(fd)
+            subprocess.run(
+                ['screencapture', '-x', fname],
+                timeout=3, check=True, capture_output=True)
+            pil = _PIL.open(fname).resize((W, H), _PIL.LANCZOS).convert('RGB')
+            arr = np.array(pil, dtype=np.uint8)
+            sh, sw = max(1, H // 32), max(1, W // 32)
+            new_hash = hash(arr[::sh, ::sw, 0].tobytes())
+            with self._lock:
+                if new_hash == self._fb_hash:
+                    return False
+                self._stale_vnc_hash = self._fb_hash
+                np.copyto(self._fb, arr)
+                if self._cg_fb is None or self._cg_fb.shape != self._fb.shape:
+                    self._cg_fb = np.empty_like(self._fb)
+                np.copyto(self._cg_fb, self._fb)
+                self._fb_hash = new_hash
+                self._fb_seq += 1
+                self._fb_ms = int(time.time() * 1000)
+                self._cg_override_until = self._fb_ms + 2000
+            return True
+        except Exception as e:
+            log.debug("cg_direct_capture failed: %s", e)
+            return False
+        finally:
+            if fname:
+                try: os.unlink(fname)
+                except: pass
+
     def _run(self):
         while True:
             try:
@@ -354,34 +419,55 @@ class VNCBridge:
                 _FBU_FULL = struct.pack("!BBHHHH", 3, 0, 0, 0, W, H)
                 s.send(_FBU_FULL)  # full initial request
                 _pending_req = True
-                _last_req_ms  = int(time.time() * 1000)
-                _last_fbu_ms  = _last_req_ms  # last time ANY FBU was received
+                _last_req_ms    = int(time.time() * 1000)
+                _last_fbu_ms    = _last_req_ms  # last time ANY FBU was received
+                _last_change_ms = _last_req_ms  # last time pixels actually changed
+                _last_keepalive_ms = _last_req_ms
+                _keepalive_idx  = 0
                 while True:
                     self._flush_input()
-                    r, _, _ = select.select([s], [], [], 0.010)  # 10ms: flush input every 10ms
+                    r, _, _ = select.select([s], [], [], 0.005)  # 5ms: lower key-event pickup latency
                     if not r:
                         now_ms   = int(time.time() * 1000)
                         stale_ms = now_ms - _last_fbu_ms
                         if not _pending_req:
-                            # Choose request type: if screensharingd has been quiet for >50ms,
-                            # force a full refresh so we own the update cadence, not it.
-                            req = _FBU_FULL if stale_ms > 25 else _FBU_INC
+                            # Use content staleness (time since last pixel change) not FBU
+                            # staleness (time since last response). screensharingd answers
+                            # _FBU_INC immediately with empty responses on a static screen,
+                            # keeping stale_ms low while content_stale_ms reflects reality.
+                            content_stale_ms = now_ms - _last_change_ms
+                            req = _FBU_FULL if content_stale_ms > 25 else _FBU_INC
                             s.send(req)
                             _pending_req = True
                             _last_req_ms = now_ms
                         elif stale_ms > 25 and now_ms - _last_req_ms >= 25:
-                            # Pending incremental request has been sitting unanswered for 50ms+
-                            # and the framebuffer is stale — screensharingd's damage detection
-                            # missed the update. Override with a forced full refresh.
+                            # Pending request unanswered for 50ms+ — override with full refresh.
                             s.send(_FBU_FULL)
                             _last_req_ms = now_ms
-                        # Delayed nudge from key event: return cursor to (x, y) 30ms after
-                        # key-up, giving the terminal time to render before we re-scan.
-                        if self._hover_after_ms > 0 and now_ms >= self._hover_after_ms:
-                            self._hover_after_ms = 0
+                        # Drain scheduled compositor-wake nudges — spaced 30ms apart so
+                        # we don't overwhelm screensharingd's FBU scheduling.
+                        if self._nudge_schedule:
+                            with self._lock:
+                                due = [t for t in self._nudge_schedule if now_ms >= t[0]]
+                                for t in due:
+                                    self._nudge_schedule.remove(t)
+                            for _, nx, ny in due:
+                                try:
+                                    s.send(struct.pack("!BBHH", 5, 0, nx, ny))
+                                except Exception:
+                                    pass
+                        # Compositor keepalive: every 100ms when screen is static, send a
+                        # tiny pointer micro-move. Prevents macOS from throttling the display
+                        # compositor's refresh rate on idle screens (which causes 500ms–3s
+                        # first-keystroke latency). At 10Hz this is imperceptible on the Mac.
+                        elif (now_ms - _last_change_ms > 500 and
+                              now_ms - _last_keepalive_ms > 100):
+                            _last_keepalive_ms = now_ms
                             lx, ly = self._last_ptr_x, self._last_ptr_y
+                            nx = lx + (_keepalive_idx % 2)
+                            _keepalive_idx += 1
                             try:
-                                s.send(struct.pack("!BBHH", 5, 0, lx, ly))
+                                s.send(struct.pack("!BBHH", 5, 0, nx, ly))
                             except Exception:
                                 pass
                         continue
@@ -410,25 +496,52 @@ class VNCBridge:
                                         self._fb[ry:ry+rh,rx:rx+rw,2]=arr[:,:,bs//8]
                         now_ms = int(time.time() * 1000)
                         if nr > 0:
-                            # Only increment _fb_seq when pixels actually changed.
-                            # Forced full-screen FBU requests (incremental=0) return the same
-                            # pixels on a static screen; sampling a few hundred pixels is
-                            # enough to detect real changes without a full 6MB comparison.
                             sh = max(1, H // 32)
                             sw = max(1, W // 32)
                             new_hash = hash(fb[::sh, ::sw, 0].tobytes())
+                            _do_cg = False
                             with self._lock:
                                 self._fbu_count += 1
-                                if new_hash != self._fb_hash:
+                                if now_ms < self._cg_override_until:
+                                    # Inside CGImage override window: screensharingd is still
+                                    # HID-idle and keeps serving the pre-keypress framebuffer.
+                                    if new_hash == self._stale_vnc_hash:
+                                        # Stale VNC data overwrote our CGImage pixels — restore.
+                                        # Re-arm the window so we keep suppressing stale writes.
+                                        if self._cg_fb is not None:
+                                            np.copyto(self._fb, self._cg_fb)
+                                        self._cg_override_until = int(time.time() * 1000) + 2000
+                                    else:
+                                        # Different hash — screensharingd woke up with real pixels.
+                                        self._fb_hash = new_hash
+                                        self._fb_seq += 1
+                                        self._fb_ms = now_ms
+                                        _last_change_ms = now_ms
+                                        self._nudge_schedule = []
+                                        self._cg_override_until = 0
+                                elif new_hash != self._fb_hash:
                                     self._fb_hash = new_hash
                                     self._fb_seq += 1
                                     self._fb_ms = now_ms
-                        _last_fbu_ms = now_ms  # received FBU; reset staleness clock
-                        # Immediately re-request for active content (video, animations).
-                        # For a stale screen this is still an incremental=1; the escalation
-                        # to incremental=0 happens in the timeout branch if screensharingd
-                        # doesn't respond within 50ms.
-                        s.send(_FBU_INC)
+                                    _last_change_ms = now_ms
+                                    self._nudge_schedule = []
+                                else:
+                                    # screensharingd returned stale pixels. If a key was
+                                    # recently pressed but no content arrived for 150ms,
+                                    # screensharingd is HID-idle — bypass with CGDisplayCreateImage.
+                                    lkm = self._last_key_ms
+                                    if lkm > 0 and now_ms - lkm > 150 and now_ms - _last_change_ms > 150:
+                                        _do_cg = True
+                            # Call outside the lock — _cg_direct_capture takes the lock internally.
+                            if _do_cg and self._cg_direct_capture(W, H):
+                                _last_change_ms = now_ms
+                        _last_fbu_ms = now_ms  # received FBU; reset response-staleness clock
+                        # Choose next request type based on content staleness, not response
+                        # staleness. If nothing has changed in the last 25ms, screensharingd
+                        # is idle — send FULL to force a fresh capture that will pick up any
+                        # terminal text that rendered since the last real pixel update.
+                        content_stale_ms = now_ms - _last_change_ms
+                        s.send(_FBU_FULL if content_stale_ms > 25 else _FBU_INC)
                         _pending_req = True
                         _last_req_ms = now_ms
                     elif mt == 2:
@@ -582,7 +695,7 @@ class EncoderPipeline:
 # AdaptiveController — per-client fps + bitrate management
 # ---------------------------------------------------------------------------
 class AdaptiveController:
-    _WB_THRESH = 131072      # 128KB asyncio write buffer before we act
+    _WB_THRESH = 32 * 1024   # must match frame-drop threshold in frame_sender
 
     def __init__(self, cfg):
         self.fps = float(cfg.max_fps)
@@ -1363,7 +1476,7 @@ function connect(){
           // Mac clipboard → browser clipboard
           if(navigator.clipboard&&navigator.clipboard.writeText)
             navigator.clipboard.writeText(msg.text).catch(()=>{});
-          st.textContent='📋 '+msg.text.substring(0,50);
+          st.textContent='[clipboard] '+msg.text.substring(0,50);
           setTimeout(()=>{st.textContent='';},3000);
         }else if(msg.t==='eval'){
           let result='';
@@ -1474,6 +1587,9 @@ ki.addEventListener('keydown',e=>{
   e.preventDefault();
 });
 ki.addEventListener('keyup',e=>{
+  // Paste combo (Ctrl+V / Cmd+V): keydown was suppressed, so skip keyup too.
+  // The server's paste handler already sent the full Meta+V sequence.
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v')return;
   send({t:'ku',k:e.key,code:e.code});
   e.preventDefault();
 });
@@ -1488,8 +1604,9 @@ ki.addEventListener('paste',e=>{
   ki.value='';
 });
 
-// Refocus hidden textarea on any canvas interaction
+// Refocus hidden textarea on any canvas interaction or window focus
 canvas.addEventListener('click',()=>ki.focus());
+window.addEventListener('focus',()=>ki.focus());
 
 // ---------------------------------------------------------------------------
 // Init
@@ -1615,6 +1732,149 @@ async def _main(cfg):
                      max_size=None, compression=None):
         await asyncio.Future()
 
+_COMPOSITOR_KEEPALIVE_SCRIPT = """\
+# Keeps macOS's display compositor running at the display refresh rate.
+# Without this, WindowServer throttles to ~3Hz on idle screens, causing
+# 500ms-3s first-keystroke latency for keyboard echo.
+#
+# Mechanism: a CVDisplayLink fires at every vblank; each callback commits a
+# CALayer change on a near-invisible topmost window. CoreAnimation propagates
+# these commits to the WindowServer render server, which must then composite
+# the full scene (including Terminal and other windows) on every vblank.
+# Position (3,25): between VNC sample-grid points, so the server's content
+# hash never changes (no false "screen is updating" signals to the encoder).
+import sys, ctypes, time
+try:
+    import AppKit, Quartz
+except ImportError:
+    sys.exit(0)
+
+try:
+    # --- CVDisplayLink via ctypes (PyObjC closure type unsupported) ---
+    cv = ctypes.CDLL("/System/Library/Frameworks/CoreVideo.framework/CoreVideo")
+    CBTYPE = ctypes.CFUNCTYPE(ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_void_p, ctypes.c_uint64,
+                               ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p)
+    _i = [0]
+    _layer = [None]
+
+    def _vblank(dl, now, out, fin, fout, ctx):
+        layer = _layer[0]
+        if layer is None:
+            return 0
+        _i[0] ^= 1
+        # Commit a 1-unit opacity change to force render server compositing.
+        Quartz.CATransaction.begin()
+        Quartz.CATransaction.setDisableActions_(True)
+        layer.setOpacity_(0.002 if _i[0] else 0.001)
+        Quartz.CATransaction.commit()
+        return 0  # kCVReturnSuccess
+
+    _cb = CBTYPE(_vblank)
+    _link = ctypes.c_void_p()
+    cv.CVDisplayLinkCreateWithActiveCGDisplays(ctypes.byref(_link))
+    cv.CVDisplayLinkSetOutputCallback(_link, _cb, None)
+
+    # --- NSWindow with a CALayer ---
+    app = AppKit.NSApplication.sharedApplication()
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyProhibited)
+    win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        AppKit.NSMakeRect(3, 25, 2, 2),
+        AppKit.NSWindowStyleMaskBorderless,
+        AppKit.NSBackingStoreBuffered,
+        False)
+    win.setAlphaValue_(0.002)
+    win.setIgnoresMouseEvents_(True)
+    win.setOpaque_(False)
+    win.setBackgroundColor_(AppKit.NSColor.clearColor())
+    win.contentView().setWantsLayer_(True)
+    _layer[0] = win.contentView().layer()
+    _layer[0].setBackgroundColor_(AppKit.NSColor.whiteColor().CGColor())
+    _layer[0].setOpacity_(0.001)
+    win.orderFrontRegardless()
+
+    # NSActivityLatencyCritical signals to WindowServer that this process
+    # has precision timing needs — prevents compositor throttling for our window.
+    _activity = AppKit.NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
+        AppKit.NSActivityLatencyCritical | AppKit.NSActivityIdleDisplaySleepDisabled,
+        "VNC compositor keepalive"
+    )
+
+    cv.CVDisplayLinkStart(_link)
+
+    # Background thread: post a HID-level mouse micro-move every 25 seconds.
+    # screensharingd's HID-idle detector only responds to kCGHIDEventTap events
+    # (real hardware level), not the kCGSessionEventTap events that VNC injection
+    # uses. Without this, screensharingd enters HID-idle after ~30s of no physical
+    # activity and stops updating its framebuffer cache.
+    import threading as _threading
+    def _hid_keepalive():
+        while True:
+            _time.sleep(25)
+            try:
+                mp = AppKit.NSEvent.mouseLocation()
+                sh = AppKit.NSScreen.mainScreen().frame().size.height
+                cy = sh - mp.y
+                e1 = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved,
+                    Quartz.CGPoint(mp.x, cy + 1), Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, e1)
+                e2 = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved,
+                    Quartz.CGPoint(mp.x, cy), Quartz.kCGMouseButtonLeft)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, e2)
+            except Exception:
+                pass
+    _threading.Thread(target=_hid_keepalive, daemon=True).start()
+
+    app.run()
+    cv.CVDisplayLinkStop(_link)
+    AppKit.NSProcessInfo.processInfo().endActivity_(_activity)
+except Exception:
+    sys.exit(0)
+"""
+
+def _start_compositor_keepalive():
+    """Spawn a tiny subprocess that keeps macOS's display compositor warm at 30fps.
+    Falls back silently if the display or tkinter is unavailable (headless, SSH-only)."""
+    try:
+        import subprocess, threading, time as _time
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _COMPOSITOR_KEEPALIVE_SCRIPT],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        log.info("compositor keepalive started (PID %d)", proc.pid)
+        def _watch():
+            _time.sleep(2)
+            rc = proc.poll()
+            if rc is not None:
+                err = proc.stderr.read(500)
+                log.warning("compositor keepalive exited rc=%d: %s", rc, err.decode(errors="replace"))
+        threading.Thread(target=_watch, daemon=True).start()
+    except Exception as e:
+        log.warning("compositor keepalive unavailable: %s", e)
+
+def _request_accessibility():
+    """Open System Settings → Accessibility if Python isn't trusted yet.
+    macOS requires kCGHIDEventTap-posting processes to have Accessibility permission."""
+    try:
+        import ctypes
+        ax = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        ax.AXIsProcessTrusted.restype = ctypes.c_bool
+        if ax.AXIsProcessTrusted():
+            log.info("Accessibility: granted")
+            return
+        log.warning("Accessibility: not granted — open System Settings → Privacy → Accessibility "
+                    "and enable Python (com.apple.python3)")
+        import subprocess
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        ])
+    except Exception as e:
+        log.debug("accessibility check: %s", e)
+
 def main():
     cfg = parse_args()
     if not cfg.vnc_pass and not (cfg.macos_user and cfg.macos_pass):
@@ -1622,6 +1882,8 @@ def main():
         raise SystemExit(1)
     target = CODEC_H264 if cfg.codec=="h264" else CODEC_H265 if cfg.codec=="h265" else CODEC_JPEG
     log.info("Target codec: %s (PyAV: %s)", cfg.codec, "yes" if _AV_OK else "NO — pip install av")
+    _request_accessibility()
+    _start_compositor_keepalive()
     asyncio.run(_main(cfg))
 
 if __name__=="__main__":
