@@ -2524,10 +2524,12 @@ const CODEC_STRINGS={
   3:'av01.0.08M.08',    // AV1 Main Profile Level 4.0
 };
 
-// Probe which codecs the browser can decode via WebCodecs (hardware preferred).
-// Returns ordered list best→worst, e.g. ['h265','h264'].
+// Probe which codecs the browser can decode via WebCodecs.
+// Tries hardware first, then software, so Firefox (software-only H.264) is detected.
+// Returns ordered list best→worst e.g. ['h265','h264']; empty = fall back to JPEG.
+const _codecHwMode={}; // codec name → hardwareAcceleration mode confirmed by probe
 async function probeSupportedCodecs(){
-  if(!useVideo)return[];
+  if(typeof VideoDecoder==='undefined')return[];
   const probes=[
     {name:'h265',codec:'hev1.1.6.L93.B0'},
     {name:'h264',codec:'avc1.640028'},
@@ -2535,13 +2537,14 @@ async function probeSupportedCodecs(){
   ];
   const out=[];
   for(const p of probes){
-    try{
-      const r=await VideoDecoder.isConfigSupported(
-        {codec:p.codec,hardwareAcceleration:'prefer-hardware'});
-      if(r.supported)out.push(p.name);
-    }catch(e){}
+    for(const hw of['prefer-hardware','prefer-software','no-preference']){
+      try{
+        const r=await VideoDecoder.isConfigSupported({codec:p.codec,hardwareAcceleration:hw});
+        if(r.supported){out.push(p.name);_codecHwMode[p.name]=hw;break;}
+      }catch(e){}
+    }
   }
-  return out; // empty list = no supported codec; caller decides fallback
+  return out;
 }
 
 function initDecoder(codec){
@@ -2564,7 +2567,8 @@ function initDecoder(codec){
         if(wsOpen)send({t:'caps',webcodecs:false,codecs:[],w:canvas.width,h:canvas.height});
       }
     });
-    decoder.configure({codec:cs,optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'});
+    const hw=_codecHwMode[CODEC_NAMES[codec]]||'prefer-hardware';
+    decoder.configure({codec:cs,optimizeForLatency:true,hardwareAcceleration:hw});
     decoderCodec=codec;
   }catch(e){console.warn('VideoDecoder configure:',e);useVideo=false;decoder=null;}
 }
