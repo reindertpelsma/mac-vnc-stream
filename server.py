@@ -1929,6 +1929,12 @@ async def client_session(ws, cfg, bridge):
     async def frame_sender():
         nonlocal seq_num, last_send_time
         known_clip = bridge.server_clipboard_seq
+        # Tell client the Mac's native capture resolution so it can build the quality menu correctly.
+        try:
+            nw, nh = bridge.dimensions
+            await ws.send(json.dumps({"t": "native", "w": nw, "h": nh}))
+        except Exception:
+            pass
         # Send current Mac clipboard immediately on connect so side menu is populated.
         if bridge.server_clipboard:
             try:
@@ -2373,9 +2379,7 @@ window.addEventListener('resize',()=>{resize();sendRes();});
 
 function setDim(w,h){
   if(w===imgW&&h===imgH)return;
-  imgW=w;imgH=h;
-  _buildQualityMenu(h);  // first call: populate resolution options based on Mac native height
-  resize();
+  imgW=w;imgH=h;resize();
 }
 
 // ---------------------------------------------------------------------------
@@ -2530,20 +2534,25 @@ function _buildQualityMenu(macH){
   if(_qMenuBuilt)return;
   _qMenuBuilt=true;
   const dpr=window.devicePixelRatio||1;
+  // Physical pixels the client's monitor can show — independent of browser window size.
   const screenPhysH=Math.round(screen.height*dpr);
-  // Maximum sensible height: no upscaling, no sending more than screen can show.
-  const maxH=macH>0?Math.min(macH,screenPhysH>0?screenPhysH:macH):screenPhysH;
+  // Cap: no upscaling past Mac native; no point sending more than screen can display.
+  // If screenPhysH is 0 or unreliable, fall back to just macH.
+  const maxH=screenPhysH>0?Math.min(macH,screenPhysH):macH;
   const sel=document.getElementById('q-res');
+  // Clear any stale options beyond the initial Auto.
+  while(sel.options.length>1)sel.remove(1);
   _Q_PRESETS.forEach(p=>{
     if(p.h>maxH)return;
     const o=document.createElement('option');
     o.value=p.h;o.textContent=p.label;
     sel.appendChild(o);
   });
-  // Restore saved choice
+  // Restore saved choice (if it's still a valid option, else default to Auto).
   const saved=_qCookie();
   _qCapH=saved.cap_h;_qFps=saved.fps;
   sel.value=String(_qCapH);
+  if(sel.value!==String(_qCapH)){sel.value='0';_qCapH=0;}
   document.getElementById('q-fps').value=String(_qFps);
 }
 
@@ -2611,7 +2620,10 @@ function connect(){
     }else{
       try{
         const msg=JSON.parse(e.data);
-        if(msg.t==='stale'){
+        if(msg.t==='native'){
+          // Mac's true capture resolution — build quality menu options from this, not canvas size.
+          _buildQualityMenu(msg.h);
+        }else if(msg.t==='stale'){
           staleMs=msg.ms||0;
         }else if(msg.t==='clipboard'){
           // Mac clipboard → dock textarea + browser clipboard.
