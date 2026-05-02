@@ -54,109 +54,84 @@ def _encode_jpeg(rgb, quality):
 # Writes frames to stdout: magic(4) + W(4LE) + H(4LE) + ts_ms(8LE) + W*H*3 RGB bytes.
 # ---------------------------------------------------------------------------
 _SCSTREAM_CAPTURE_SRC = r"""
-import sys, struct, time, ctypes, math
+# CGWindowListCreateImage polling capture subprocess.
+# CGDisplayStream returns NULL on macOS 26+; SCK/AVFoundation require a separate TCC
+# grant that isn't in the legacy kTCCServiceScreenCapture DB entry.
+# CGWindowListCreateImage still honours the legacy grant and delivers ~45fps peak.
+# No artificial fps cap: the subprocess runs as fast as CGWindowListCreateImage allows
+# (~20ms per frame = ~48fps at 1920x1080).  The server's frame_sender enforces
+# the per-client fps target via its own rate-limit loop.
+# Frame wire format: UVNC(4) + W(4LE uint32) + H(4LE uint32) + ts_ms(8LE uint64) + W*H*3 RGB bytes.
+import sys, os, struct, time, ctypes
 import numpy as np
+import Quartz
 
-cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
-
-# CGWindowListCreateImage composites all on-screen windows — required on macOS 15+
-# because CGDisplayCreateImage only returns the wallpaper layer (no window compositor).
-class CGRect(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
-                ("w", ctypes.c_double), ("h", ctypes.c_double)]
-
-cg.CGWindowListCreateImage.restype = ctypes.c_void_p
-cg.CGWindowListCreateImage.argtypes = [CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
-cg.CGImageRelease.argtypes = [ctypes.c_void_p]
-cg.CGImageGetWidth.restype  = ctypes.c_size_t; cg.CGImageGetWidth.argtypes  = [ctypes.c_void_p]
-cg.CGImageGetHeight.restype = ctypes.c_size_t; cg.CGImageGetHeight.argtypes = [ctypes.c_void_p]
-cg.CGImageGetBytesPerRow.restype = ctypes.c_size_t; cg.CGImageGetBytesPerRow.argtypes = [ctypes.c_void_p]
-cg.CGImageGetDataProvider.restype = ctypes.c_void_p; cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
-cg.CGDataProviderCopyData.restype = ctypes.c_void_p; cg.CGDataProviderCopyData.argtypes = [ctypes.c_void_p]
-cf.CFDataGetBytePtr.restype = ctypes.c_void_p; cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
-cf.CFDataGetLength.restype  = ctypes.c_long;  cf.CFDataGetLength.argtypes  = [ctypes.c_void_p]
-cf.CFRelease.argtypes = [ctypes.c_void_p]
-
-# kCGWindowListOptionOnScreenOnly=1, kCGNullWindowID=0, kCGWindowImageDefault=0
-# CGRectNull = {inf, inf, 0, 0} — instructs CGWindowListCreateImage to use all screens
-_RECT_NULL = CGRect(math.inf, math.inf, 0.0, 0.0)
-_ON_SCREEN  = ctypes.c_uint32(1)
-_NULL_WIN   = ctypes.c_uint32(0)
-_IMG_DEFAULT = ctypes.c_uint32(0)
-
-def _capture():
-    return cg.CGWindowListCreateImage(_RECT_NULL, _ON_SCREEN, _NULL_WIN, _IMG_DEFAULT)
-
-# Startup probe
-_test = _capture()
-if not _test:
-    sys.stderr.write("Screen Recording not granted\n")
-    sys.exit(1)
-cg.CGImageRelease(_test)
-
-out = sys.stdout.buffer
 MAGIC = b'UVNC'
-TARGET_FPS = 60
-interval = 1.0 / TARGET_FPS
-W_prev = H_prev = 0
-bgra_buf = rgb_buf = None
-prev_hash = None
-consec_null = 0
+out   = sys.stdout.buffer
+
+_cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+_cg.CGMainDisplayID.restype      = ctypes.c_uint32
+_cg.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]; _cg.CGDisplayPixelsWide.restype = ctypes.c_size_t
+_cg.CGDisplayPixelsHigh.argtypes = [ctypes.c_uint32]; _cg.CGDisplayPixelsHigh.restype = ctypes.c_size_t
+
+display = _cg.CGMainDisplayID()
+W = int(_cg.CGDisplayPixelsWide(display))
+H = int(_cg.CGDisplayPixelsHigh(display))
+if W <= 0 or H <= 0:
+    sys.stderr.write("CGWindowListCapture: invalid display dimensions\n")
+    sys.exit(1)
+
+sys.stderr.write(f"CGWindowListCapture: starting {W}x{H} at max fps\n")
+sys.stderr.flush()
+
+# Pre-allocate a reusable BGRA buffer and bitmap context (avoids per-frame alloc).
+bpr = W * 4
+buf = (ctypes.c_uint8 * (bpr * H))()
+ctx = Quartz.CGBitmapContextCreateWithData(
+    buf, W, H, 8, bpr,
+    Quartz.CGColorSpaceCreateDeviceRGB(),
+    Quartz.kCGImageAlphaNoneSkipFirst | Quartz.kCGBitmapByteOrder32Host,
+    None, None
+)
+if not ctx:
+    sys.stderr.write("CGWindowListCapture: CGBitmapContextCreateWithData failed\n")
+    sys.exit(1)
+
+bounds   = Quartz.CGRectMake(0, 0, W, H)
+ppid     = os.getppid()
+_ppid_check = 0  # check parent liveness every ~5s (kills every frame is wasteful)
 
 while True:
-    t0 = time.time()
-    img = _capture()
-    if not img:
-        consec_null += 1
-        if consec_null > 60:
-            sys.exit(1)
+    _ppid_check += 1
+    if _ppid_check >= 150:   # ~5s at ~30fps average
+        _ppid_check = 0
+        try:
+            os.kill(ppid, 0)
+        except ProcessLookupError:
+            break
+
+    img = Quartz.CGWindowListCreateImage(
+        Quartz.CGRectInfinite,
+        Quartz.kCGWindowListOptionOnScreenOnly,
+        Quartz.kCGNullWindowID,
+        Quartz.kCGWindowImageDefault,
+    )
+    if img is None:
         time.sleep(0.1)
         continue
-    consec_null = 0
-    W = cg.CGImageGetWidth(img)
-    H = cg.CGImageGetHeight(img)
-    bpr = cg.CGImageGetBytesPerRow(img)
-    dp = cg.CGImageGetDataProvider(img)
-    data_ref = cg.CGDataProviderCopyData(dp)
-    bptr = cf.CFDataGetBytePtr(data_ref)
-    blen = cf.CFDataGetLength(data_ref)
-    if W != W_prev or H != H_prev:
-        W_prev, H_prev = W, H
-        bgra_buf = np.empty((H, W, 4), dtype=np.uint8)
-        rgb_buf  = np.empty((H, W, 3), dtype=np.uint8)
-        prev_hash = None
-    raw = (ctypes.c_ubyte * blen).from_address(bptr)
-    arr = np.frombuffer(raw, dtype=np.uint8)
-    if bpr == W * 4:
-        np.copyto(bgra_buf, arr[:H * W * 4].reshape(H, W, 4))
-    else:
-        for r in range(H):
-            bgra_buf[r] = arr[r * bpr: r * bpr + W * 4].reshape(W, 4)
-    cf.CFRelease(data_ref)
-    cg.CGImageRelease(img)
-    # BGRA → RGB
-    np.copyto(rgb_buf, bgra_buf[:, :, 2::-1])
-    # Change detection: sample every 8th pixel — fast, catches any visual change
-    sh, sw = max(1, H // 32), max(1, W // 32)
-    new_hash = hash(rgb_buf[::sh, ::sw, 0].tobytes())
-    if new_hash == prev_hash:
-        rem = interval - (time.time() - t0)
-        if rem > 0.001:
-            time.sleep(rem)
-        continue
-    prev_hash = new_hash
-    ts = int(t0 * 1000)
-    hdr = MAGIC + struct.pack('<IIQ', W, H, ts)
+
+    Quartz.CGContextDrawImage(ctx, bounds, img)
+
+    bgra = np.frombuffer(buf, dtype=np.uint8).reshape(H, W, 4)
+    rgb  = np.ascontiguousarray(bgra[:, :, 2::-1])   # BGRA → RGB
+
+    ts_ms = int(time.time() * 1000)
     try:
-        out.write(hdr)
-        out.write(rgb_buf.tobytes())
+        out.write(MAGIC + struct.pack('<IIQ', W, H, ts_ms))
+        out.write(rgb.tobytes())
         out.flush()
     except BrokenPipeError:
-        break
-    rem = interval - (time.time() - t0)
-    if rem > 0.001:
-        time.sleep(rem)
+        os._exit(0)
 """
 
 # ---------------------------------------------------------------------------
@@ -675,7 +650,7 @@ class VNCBridge:
         threading.Thread(target=self._run, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# DisplayStreamBridge — direct screen capture via CGDisplayCreateImage subprocess.
+# DisplayStreamBridge — direct screen capture via CGWindowListCreateImage subprocess.
 # Requires Screen Recording (kTCCServiceScreenCapture) granted to python3.
 # Falls back gracefully: if no frame within 5s, is_running() returns False and
 # BridgeProxy switches to VNCBridge for all capture calls.
@@ -1341,8 +1316,10 @@ async def client_session(ws, cfg, bridge):
                     await asyncio.sleep(0.01)
                     continue
 
-                # Static-screen skip: no new content, poll at 60fps max so changes are
-                # detected within 16ms even when the adaptive controller has reduced fps.
+                # Static-screen skip: no new content — poll at 1ms so the next
+                # frame is detected and encoded within 1-2ms of the subprocess writing
+                # it.  Shorter poll than the capture interval keeps encode latency low
+                # and `last_send_time` drift from piling up between captures.
                 cur_fb_seq = bridge._fb_seq
                 if cur_fb_seq == _last_encoded_seq and _pipe_task is None:
                     if not _was_static:
@@ -1377,7 +1354,7 @@ async def client_session(ws, cfg, bridge):
                                         log.debug("static heartbeat: %dkbps q=%d", br_s // 1000, quality)
                                 except Exception as e:
                                     log.warning("heartbeat frame err: %s", e)
-                    await asyncio.sleep(min(interval, 1.0 / 60.0))
+                    await asyncio.sleep(0.001)
                     continue
 
                 # Screen just changed — jump to peak bitrate immediately
@@ -2436,39 +2413,37 @@ def _request_accessibility():
         log.debug("accessibility check: %s", e)
 
 def _check_screen_capture():
-    """Check Screen Recording permission by attempting an actual capture.
-    CGPreflightScreenCaptureAccess() returns False even when TCC has the grant
-    for LaunchAgent / SSH-launched processes on macOS 15+, so we probe by calling
-    CGWindowListCreateImage directly. Returns True if capture succeeds.
+    """Probe whether CGWindowListCreateImage is available and Screen Recording is granted.
+    Returns True if a non-NULL image is obtained.
 
-    NOTE: CGWindowListCreateImage polling at 60fps locks the compositor and freezes
-    the UI. DisplayStreamBridge is disabled until a push-based CGDisplayStream
-    implementation replaces the polling loop. Returning False here disables it."""
-    return False  # TODO: replace with CGDisplayStream push API
+    CGPreflightScreenCaptureAccess() returns False even when TCC has the grant for
+    LaunchAgent processes on macOS 15+.  On macOS 26+, CGDisplayStream returns NULL
+    despite the TCC grant (the API is functionally removed); this probe uses
+    CGWindowListCreateImage which still honours the legacy kTCCServiceScreenCapture grant."""
+    import subprocess
+    _probe = r"""
+import sys, ctypes
+import Quartz
+img = Quartz.CGWindowListCreateImage(
+    Quartz.CGRectInfinite,
+    Quartz.kCGWindowListOptionOnScreenOnly,
+    Quartz.kCGNullWindowID,
+    Quartz.kCGWindowImageDefault,
+)
+sys.exit(0 if img else 1)
+"""
     try:
-        import ctypes, math
-        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-        class _CGRect(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
-                        ("w", ctypes.c_double), ("h", ctypes.c_double)]
-        cg.CGWindowListCreateImage.restype = ctypes.c_void_p
-        cg.CGWindowListCreateImage.argtypes = [_CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
-        cg.CGImageRelease.argtypes = [ctypes.c_void_p]
-        img = cg.CGWindowListCreateImage(_CGRect(math.inf, math.inf, 0.0, 0.0), 1, 0, 0)
-        if img:
-            cg.CGImageRelease(img)
-            log.info("Screen Recording: granted — CGWindowListCreateImage capture available")
+        p = subprocess.run([sys.executable, "-c", _probe],
+                           timeout=6, capture_output=True)
+        if p.returncode == 0:
+            log.info("Screen Recording: CGWindowListCreateImage available and granted")
             return True
-        try:
-            cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
-            cg.CGRequestScreenCaptureAccess()
-        except Exception:
-            pass
-        log.warning("Screen Recording: not granted — showing permission dialog. "
-                    "Grant in System Settings → Privacy → Screen Recording, then restart server.")
+        reason = p.stderr.decode(errors='replace').strip()
+        log.warning("Screen Recording: CGWindowListCreateImage unavailable — %s",
+                    reason or "permission not granted or no display session")
         return False
     except Exception as e:
-        log.debug("screen capture check: %s", e)
+        log.debug("screen capture probe failed: %s", e)
         return False
 
 def main():
