@@ -319,6 +319,53 @@ def _poll_cg_kb():
         time.sleep(5)
         _check_cg_kb()
 
+# Previous VNC button mask for delta detection (CGEvent path only).
+_cg_mouse_prev_btn: int = 0
+
+# kCGEvent* constants accessed at call-time to avoid import-time Quartz dependency.
+_CG_BTNS = (
+    # (mask, down_event,           up_event,             button_index)
+    (1, "kCGEventLeftMouseDown",  "kCGEventLeftMouseUp",  "kCGMouseButtonLeft"),
+    (2, "kCGEventOtherMouseDown", "kCGEventOtherMouseUp", "kCGMouseButtonCenter"),
+    (4, "kCGEventRightMouseDown", "kCGEventRightMouseUp", "kCGMouseButtonRight"),
+)
+
+def _cg_send_pointer(buttons: int, x: int, y: int) -> bool:
+    """Send mouse move/click via CGEvent (kCGHIDEventTap).
+
+    Coordinates are in VNC space (top-left origin, logical pixels).
+    CGEvent uses bottom-left origin so Y is flipped via screen height.
+    Returns True on success; caller falls back to VNC on False.
+    """
+    global _cg_mouse_prev_btn
+    try:
+        import Quartz as _Q, AppKit as _AK
+        sh = _AK.NSScreen.mainScreen().frame().size.height
+        pt = _Q.CGPoint(x, sh - y)
+        changed = buttons ^ _cg_mouse_prev_btn
+        _cg_mouse_prev_btn = buttons
+
+        # Move / drag event
+        if buttons & 1:
+            move_type = _Q.kCGEventLeftMouseDragged
+        elif buttons & 4:
+            move_type = _Q.kCGEventRightMouseDragged
+        else:
+            move_type = _Q.kCGEventMouseMoved
+        _Q.CGEventPost(_Q.kCGHIDEventTap,
+                       _Q.CGEventCreateMouseEvent(None, move_type, pt, _Q.kCGMouseButtonLeft))
+
+        # Button press/release for changed bits
+        for mask, dn_name, up_name, btn_name in _CG_BTNS:
+            if changed & mask:
+                etype = getattr(_Q, dn_name if (buttons & mask) else up_name)
+                btn   = getattr(_Q, btn_name)
+                _Q.CGEventPost(_Q.kCGHIDEventTap,
+                               _Q.CGEventCreateMouseEvent(None, etype, pt, btn))
+        return True
+    except Exception:
+        return False
+
 def _recv(sock, n):
     buf = bytearray()
     while len(buf) < n:
@@ -532,6 +579,37 @@ class VNCBridge:
             # Pointer with all buttons released
             self._input_q.append(struct.pack("!BBHH", 5, 0, self._last_ptr_x, self._last_ptr_y))
 
+    def _restart_screensharingd(self) -> bool:
+        """Kill and restart screensharingd using the macOS login password from config.
+        Blocks until port 5900 reopens (≤15s) or gives up. Returns True on success."""
+        pw = getattr(self._cfg, 'macos_pass', '')
+        if not pw:
+            log.warning("screensharingd restart: no macos_pass configured — skipping")
+            return False
+        log.warning("Restarting screensharingd…")
+        try:
+            subprocess.run(
+                ['sudo', '-S', 'launchctl', 'kickstart', '-k',
+                 'system/com.apple.screensharing'],
+                input=(pw + '\n').encode(),
+                capture_output=True, timeout=10)
+        except Exception as e:
+            log.warning("screensharingd restart command failed: %s", e)
+            return False
+        host = getattr(self._cfg, 'vnc_host', '127.0.0.1')
+        port = getattr(self._cfg, 'vnc_port', 5900)
+        for _ in range(15):
+            time.sleep(1)
+            try:
+                s = socket.socket(); s.settimeout(1)
+                s.connect((host, port)); s.close()
+                log.info("screensharingd restarted — port %d open", port)
+                return True
+            except Exception:
+                pass
+        log.warning("screensharingd restart: port %d still closed after 15s", port)
+        return False
+
     def _flush_input(self):
         with self._lock:
             msgs = self._input_q[:]
@@ -659,6 +737,13 @@ class VNCBridge:
                             log.info("VNC: periodic reconnect to prevent screensharingd input stall")
                             _force_reconnect = True
                             break
+                        # Watchdog: if screensharingd stopped sending FBUs for 30s,
+                        # treat it as a hard hang and restart if manage_screensharingd=True.
+                        if getattr(self._cfg, 'manage_screensharingd', False):
+                            if now_ms - _last_fbu_ms > 30_000:
+                                log.warning("VNC: no FBU for 30s — screensharingd appears hung")
+                                self._restart_screensharingd()
+                                break  # reconnect outer loop will re-connect VNC
                         stale_ms = now_ms - _last_fbu_ms
                         if not _pending_req:
                             # Use content staleness (time since last pixel change) not FBU
@@ -811,9 +896,67 @@ class VNCBridge:
             except Exception:
                 pass
 
+    def _screensharingd_pid_watcher(self):
+        """Poll screensharingd process existence every 5s.
+        If the process dies, restart screensharingd immediately — much faster
+        than waiting for the 30s FBU-stall watchdog in _run().
+        Only runs when manage_screensharingd=True."""
+        while True:
+            time.sleep(5)
+            if not getattr(self._cfg, 'manage_screensharingd', False):
+                continue
+            try:
+                r = subprocess.run(['pgrep', '-x', 'screensharingd'],
+                                   capture_output=True, timeout=2)
+                if r.returncode != 0:
+                    log.warning("screensharingd process not found — restarting")
+                    self._restart_screensharingd()
+            except Exception:
+                pass
+
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         threading.Thread(target=self._pbpaste_poll, daemon=True).start()
+        threading.Thread(target=self._screensharingd_pid_watcher,
+                         daemon=True, name="ssd-pid-watcher").start()
+
+# ---------------------------------------------------------------------------
+# TCC permission watcher — polls TCC.db mtime and fires callbacks when
+# Screen Recording or Accessibility grants appear (or are revoked).
+# This lets the server upgrade from VNC fallback to native APIs live,
+# without requiring a process restart after the user clicks Allow.
+# ---------------------------------------------------------------------------
+class TCCWatcher:
+    """Watches TCC.db mtime and fires on_tcc_change() when permissions may have changed.
+
+    Does NOT interpret the DB content — callers decide what to probe after a change.
+    This avoids false positives from bundle-ID vs path-based grant mismatches.
+    """
+    _TCC_DB = os.path.expanduser(
+        "~/Library/Application Support/com.apple.TCC/TCC.db")
+
+    def __init__(self, on_tcc_change=None, interval=5):
+        self._on_change  = on_tcc_change
+        self._interval   = interval
+        self._last_mtime = 0.0
+
+    def start(self):
+        threading.Thread(target=self._watch, daemon=True, name="tcc-watcher").start()
+
+    def _watch(self):
+        while True:
+            time.sleep(self._interval)
+            try:
+                mtime = os.path.getmtime(self._TCC_DB)
+                if mtime != self._last_mtime:
+                    self._last_mtime = mtime
+                    if self._on_change:
+                        try:
+                            self._on_change()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------------
 # DisplayStreamBridge — direct screen capture via SCK (ScreenCaptureKit) subprocess.
@@ -1606,30 +1749,50 @@ async def client_session(ws, cfg, bridge):
                     elif t == "metric_rtt":
                         ctrl.on_metric_rtt(float(ev.get("rtt_ms", 0)))
                     elif t == "mm":
-                        bridge.send_pointer(cur_buttons, int(ev["x"]), int(ev["y"]))
+                        x2, y2 = int(ev["x"]), int(ev["y"])
+                        if not (_cg_kb_ok and _cg_send_pointer(cur_buttons, x2, y2)):
+                            bridge.send_pointer(cur_buttons, x2, y2)
                     elif t == "md":
                         b = ev.get("b", 0)
-                        cur_buttons |= (1<<b)
-                        bridge.send_pointer(cur_buttons, int(ev["x"]), int(ev["y"]))
+                        cur_buttons |= (1 << b)
+                        x2, y2 = int(ev["x"]), int(ev["y"])
+                        if not (_cg_kb_ok and _cg_send_pointer(cur_buttons, x2, y2)):
+                            bridge.send_pointer(cur_buttons, x2, y2)
                     elif t == "mu":
                         b = ev.get("b", 0)
-                        cur_buttons &= ~(1<<b)
-                        bridge.send_pointer(cur_buttons, int(ev.get("x",0)), int(ev.get("y",0)))
+                        cur_buttons &= ~(1 << b)
+                        x2, y2 = int(ev.get("x", 0)), int(ev.get("y", 0))
+                        if not (_cg_kb_ok and _cg_send_pointer(cur_buttons, x2, y2)):
+                            bridge.send_pointer(cur_buttons, x2, y2)
                     elif t == "sc":
                         x, y = int(ev.get("x",0)), int(ev.get("y",0))
-                        # dy/dx are pre-normalized click counts with sign by the browser
                         dx, dy = int(ev.get("dx",0)), int(ev.get("dy",0))
-                        evts = []
-                        if dy: evts.append((8 if dy < 0 else 16, abs(dy)))   # up/down
-                        if dx: evts.append((32 if dx < 0 else 64, abs(dx)))  # left/right
-                        async def _scroll(evts=evts, sx=x, sy=y):
-                            for btn, n in evts:
-                                for _ in range(n):
-                                    bridge.send_pointer(btn, sx, sy)
-                                    bridge.send_pointer(0, sx, sy)
-                                    if n > 1:
-                                        await asyncio.sleep(0.012)
-                        asyncio.create_task(_scroll())
+                        if _cg_kb_ok:
+                            # CGEvent scroll wheel — smoother than VNC button-click simulation
+                            try:
+                                import Quartz as _Q
+                                if dy:
+                                    e = _Q.CGEventCreateScrollWheelEvent(
+                                        None, _Q.kCGScrollEventUnitLine, 1, -dy)
+                                    _Q.CGEventPost(_Q.kCGHIDEventTap, e)
+                                if dx:
+                                    e = _Q.CGEventCreateScrollWheelEvent(
+                                        None, _Q.kCGScrollEventUnitLine, 2, 0, -dx)
+                                    _Q.CGEventPost(_Q.kCGHIDEventTap, e)
+                            except Exception:
+                                pass
+                        else:
+                            evts = []
+                            if dy: evts.append((8 if dy < 0 else 16, abs(dy)))
+                            if dx: evts.append((32 if dx < 0 else 64, abs(dx)))
+                            async def _scroll(evts=evts, sx=x, sy=y):
+                                for btn, n in evts:
+                                    for _ in range(n):
+                                        bridge.send_pointer(btn, sx, sy)
+                                        bridge.send_pointer(0, sx, sy)
+                                        if n > 1:
+                                            await asyncio.sleep(0.012)
+                            asyncio.create_task(_scroll())
                     elif t in ("kd","ku"):
                         k = ev.get("k",""); code = ev.get("code","")
                         down = t == "kd"
@@ -2823,12 +2986,49 @@ def parse_args():
                    help="Video codec (default h264)")
     p.add_argument("--password", default=os.environ.get("MVS_PASSWORD",""),
                    help="Optional access token for WebSocket URL (?token=...)")
-    return p.parse_args()
 
-async def _main(cfg, ds=None):
+    # Capture / input mode selection
+    p.add_argument("--capture", choices=["auto","sck","vnc"],
+                   default=os.environ.get("CAPTURE_MODE","auto"),
+                   help="Screen capture mode: auto=SCK with VNC fallback, sck=SCK only, vnc=VNC only")
+    p.add_argument("--input", choices=["auto","cgevent","vnc"],
+                   default=os.environ.get("INPUT_MODE","auto"),
+                   help="Input mode: auto=CGEvent with VNC fallback, cgevent=CGEvent only, vnc=VNC only")
+    # Convenience shortcuts
+    p.add_argument("--vnc-only", action="store_true",
+                   help="Force VNC for both capture and input (sets --capture vnc --input vnc)")
+    p.add_argument("--api-only", action="store_true",
+                   help="Force native APIs only — no VNC at all (sets --capture sck --input cgevent)")
+    # screensharingd lifecycle management
+    p.add_argument("--manage-screensharingd", action="store_true", default=None,
+                   help="Auto-restart screensharingd when VNC stalls (default: on when macos_pass is set and VNC is needed)")
+    p.add_argument("--no-manage-screensharingd", action="store_true",
+                   help="Disable auto-management of screensharingd")
+
+    args = p.parse_args()
+
+    # Apply shortcuts
+    if args.vnc_only:
+        args.capture = "vnc"; args.input = "vnc"
+    if args.api_only:
+        args.capture = "sck"; args.input = "cgevent"
+
+    # Resolve manage_screensharingd: explicit flags first, then auto-enable
+    # when VNC is needed and we have the macOS password to do the restart.
+    if args.no_manage_screensharingd:
+        args.manage_screensharingd = False
+    elif args.manage_screensharingd is None:
+        vnc_needed = (args.capture in ("auto","vnc") or args.input in ("auto","vnc"))
+        args.manage_screensharingd = bool(vnc_needed and args.macos_pass)
+
+    return args
+
+async def _main(cfg, ds=None, vnc=None):
     from websockets import serve
-    vnc = VNCBridge(cfg)
-    vnc.start()
+
+    if vnc is None:
+        vnc = VNCBridge(cfg)
+        vnc.start()
     bridge = BridgeProxy(vnc, ds)
 
     http_handler = make_http_handler(cfg, bridge)
@@ -2836,25 +3036,53 @@ async def _main(cfg, ds=None):
 
     cap_mode = "SCK" if (ds and ds.is_running()) else "VNC"
     handler = lambda ws: ws_handler(ws)
-    log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s",
-             cfg.listen, cfg.port, cfg.codec, cfg.max_fps, cap_mode)
+    log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s  input=%s  manage_ssd=%s",
+             cfg.listen, cfg.port, cfg.codec, cfg.max_fps, cap_mode,
+             "CGEvent" if _cg_kb_ok else "VNC",
+             cfg.manage_screensharingd)
+
+    loop = asyncio.get_event_loop()
+
+    async def _sck_upgrade():
+        """Try to activate SCK capture. Called from TCC watcher or retry loop."""
+        if bridge._d is not None and bridge._d.is_running():
+            return
+        try:
+            ip = InProcessSCKBridge()
+            ok = await loop.run_in_executor(None, ip.start)
+            if ok:
+                bridge.set_capture(ip)
+                log.info("SCK capture activated — now 60fps")
+        except Exception as e:
+            log.debug("SCK upgrade attempt: %s", e)
 
     async def _sck_retry_loop():
-        """Background task: retry InProcessSCKBridge every 30s.
-        Activates 60fps capture automatically after user grants Screen Recording permission."""
+        """Retry SCK every 30s — activates automatically after Screen Recording is granted."""
         await asyncio.sleep(30)
         while True:
-            if bridge._d is None or not bridge._d.is_running():
-                try:
-                    loop = asyncio.get_event_loop()
-                    ip = InProcessSCKBridge()
-                    ok = await loop.run_in_executor(None, ip.start)
-                    if ok:
-                        bridge.set_capture(ip)
-                        log.info("SCK capture activated via retry — now 60fps")
-                except Exception as e:
-                    log.debug("SCK retry: %s", e)
+            if cfg.capture != "vnc":
+                await _sck_upgrade()
             await asyncio.sleep(30)
+
+    # TCC watcher: fires on TCC.db mtime change. Does not interpret the DB —
+    # we re-probe each capability live and act only when the result changes.
+    was_cg_ok = _cg_kb_ok
+
+    def _on_tcc_change():
+        nonlocal was_cg_ok
+        # Accessibility / CGEvent input
+        if cfg.input != "vnc":
+            now_cg = _check_cg_kb()
+            if now_cg and not was_cg_ok:
+                log.info("TCC: Accessibility granted — CGEvent keyboard+mouse now active")
+            elif not now_cg and was_cg_ok:
+                log.warning("TCC: Accessibility revoked — input falling back to VNC")
+            was_cg_ok = now_cg
+        # Screen Recording / SCK capture — only try upgrade if not already running
+        if cfg.capture != "vnc" and (bridge._d is None or not bridge._d.is_running()):
+            asyncio.run_coroutine_threadsafe(_sck_upgrade(), loop)
+
+    TCCWatcher(on_tcc_change=_on_tcc_change).start()
 
     async with serve(handler, cfg.listen, cfg.port,
                      process_request=http_handler,
@@ -3090,29 +3318,61 @@ except Exception as e:
 
 def main():
     cfg = parse_args()
-    if not cfg.vnc_pass and not (cfg.macos_user and cfg.macos_pass):
-        print("Error: provide --vnc-pass or --macos-user + --macos-pass")
-        raise SystemExit(1)
     log.info("Target codec: %s (PyAV: %s)", cfg.codec, "yes" if _AV_OK else "NO — pip install av")
+    log.info("Mode: capture=%s  input=%s  manage_screensharingd=%s",
+             cfg.capture, cfg.input, cfg.manage_screensharingd)
+
     _request_screen_capture_access()
     _request_accessibility()
     _start_compositor_keepalive()
+
+    # Resolve initial CGEvent availability
     if not _check_cg_kb():
-        log.warning("CGEvent keyboard: Accessibility not granted — using VNC keysym fallback. "
-                    "Enable in System Settings > Privacy > Accessibility.")
-        threading.Thread(target=_poll_cg_kb, daemon=True).start()
+        if cfg.input == "cgevent":
+            log.warning("CGEvent input requested but Accessibility not granted — "
+                        "will retry automatically when permission is granted.")
+        else:
+            log.warning("Accessibility not granted — input falls back to VNC. "
+                        "Enable in System Settings > Privacy > Accessibility.")
+        if cfg.input != "vnc":
+            threading.Thread(target=_poll_cg_kb, daemon=True).start()
+
+    # Resolve initial screen capture
     ds = None
-    # Try in-process SCK first: avoids subprocess permission/session issues on macOS 26.
-    ip = InProcessSCKBridge()
-    if ip.start():
-        ds = ip
-        log.info("capture=SCK-inproc")
-    elif _check_screen_capture():
-        ds = DisplayStreamBridge()
-        if not ds.start():
-            log.warning("DisplayStreamBridge failed — falling back to VNC capture")
-            ds = None
-    asyncio.run(_main(cfg, ds))
+    if cfg.capture != "vnc":
+        ip = InProcessSCKBridge()
+        if ip.start():
+            ds = ip
+            log.info("capture=SCK-inproc")
+        elif _check_screen_capture():
+            ds = DisplayStreamBridge()
+            if not ds.start():
+                log.warning("DisplayStreamBridge failed — falling back to VNC capture")
+                ds = None
+
+    # Start VNC only if it might be needed for capture or input.
+    # In --api-only mode (SCK + CGEvent) we skip VNCBridge entirely so
+    # screensharingd is never touched.
+    vnc = None
+    vnc_needed = (
+        (cfg.capture in ("auto", "vnc") and ds is None) or
+        (cfg.input in ("auto", "vnc") and not _cg_kb_ok)
+    )
+    if vnc_needed or cfg.capture == "vnc" or cfg.input == "vnc":
+        if not cfg.vnc_pass and not (cfg.macos_user and cfg.macos_pass):
+            log.error("VNC needed but no credentials — provide --vnc-pass or "
+                      "--macos-user + --macos-pass")
+            raise SystemExit(1)
+        vnc = VNCBridge(cfg)
+        vnc.start()
+    else:
+        log.info("VNC not needed — screensharingd will not be contacted")
+        # Still need a VNCBridge for clipboard polling (pbpaste) even if
+        # not used for capture/input — create a minimal one without _run().
+        vnc = VNCBridge(cfg)
+        threading.Thread(target=vnc._pbpaste_poll, daemon=True).start()
+
+    asyncio.run(_main(cfg, ds, vnc))
 
 if __name__=="__main__":
     main()
