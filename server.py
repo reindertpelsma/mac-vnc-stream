@@ -2514,7 +2514,7 @@ function setDim(w,h){
 // ---------------------------------------------------------------------------
 // WebCodecs decoder
 // ---------------------------------------------------------------------------
-let useVideo=typeof VideoDecoder!=='undefined';
+let useVideo=false; // set true only after caps probe confirms a working codec
 let decoder=null,decoderCodec=-1;
 
 // Codec byte → WebCodecs codec string
@@ -2728,11 +2728,12 @@ function connect(){
     const haswc=typeof VideoDecoder!=='undefined';
     if(haswc){
       probeSupportedCodecs().then(codecs=>{
-        // If no codec probed as supported (e.g. Firefox has VideoDecoder but no H.264/H.265),
-        // tell server webcodecs:false so it sends JPEG which every browser can decode.
-        const wc=codecs.length>0;
-        if(!wc)useVideo=false;
-        send({t:'caps',webcodecs:wc,codecs,
+        // Enable VideoDecoder path only after we confirm a codec works.
+        // Frames that arrived before this point go through the JPEG path (fail
+        // silently on H.264 data — createImageBitmap rejects non-JPEG — which is
+        // fine: just a brief blank until the server switches codec).
+        useVideo=codecs.length>0;
+        send({t:'caps',webcodecs:useVideo,codecs,
               w:canvas.width,h:canvas.height});
         sendQuality();
       });
