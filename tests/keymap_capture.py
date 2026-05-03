@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""debug_keylog.py — key event logger for mac-vnc-stream keyboard testing.
+"""tests/keymap_capture.py — manual test fixture for keyboard input forwarding.
 
-Logs every key event to /tmp/keylog.txt with full modifier and keycode details.
-All command-key shortcuts (Cmd+Q, Cmd+H, Cmd+M, etc.) are intercepted and
-logged but NOT acted on — the window stays alive and in focus throughout testing.
+Opens a foreground GUI window that records every NSEvent it receives to
+/tmp/keylog.txt with full modifier + keycode detail. Used with test_keys.py
+(in the repo root) to verify that the kd/ku stream from the browser arrives
+intact at the macOS event loop, including Cmd-key chords normally consumed
+by the system.
 
-Run as a GUI LaunchAgent (needs display access). See test_keys.py to send combos.
+This is a TEST FIXTURE, not part of the server. It is only invoked when run
+manually for keyboard-input verification — no production code imports it,
+no install path launches it, no LaunchAgent references it. It writes to
+/tmp/keylog.txt only while the window is open and the test is running.
 """
 import sys, datetime, os
 

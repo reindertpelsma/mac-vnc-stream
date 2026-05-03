@@ -4,6 +4,8 @@
 
 No third-party accounts. No cloud relay. Just a Python script and a browser.
 
+> Solo project, ~140 commits, first public release. Read [`STATUS.md`](STATUS.md) for what's tested, what isn't, and what to expect.
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
 ```
@@ -18,11 +20,11 @@ open "http://localhost:6081/?token=YOUR_TOKEN"
 
 ## Who is this for
 
-The core offer: browser-based access to a macOS screen, through an SSH tunnel, with nothing in the path except your own server. That combination is not available anywhere else as a self-hosted tool.
+The core offer: browser-based access to a macOS screen through an SSH tunnel, with nothing in the path except your own server. NoMachine, RustDesk, Apple Remote Desktop and Parsec all do remote-desktop-to-macOS; what's distinctive here is the specific combination of **browser-only client, SSH-only transport, no relay infrastructure, hardware-decoded video via WebCodecs, and a congestion controller designed for SSH-tunnelled TCP** — that last point is what keeps it usable on a constrained link, where most browser-VNC stacks fill TCP buffers and produce multi-second lag spikes.
 
 **Cloud and on-premise Mac infrastructure.** AWS EC2 Mac instances, MacStadium, Hetzner Mac minis, and rack-mounted Mac minis in CI rooms all need occasional GUI access — to click through a permission dialog, configure Xcode, or debug something that only reproduces on the physical display. SSH gets you a shell; this gets you a screen.
 
-**On the same network.** If you SSH into a Mac at home or in the office, you can add `-L 6081:localhost:6081` to that command and open a browser tab. No client to install, no account to create, no relay. It is the only self-hosted solution that combines ScreenCaptureKit capture, hardware H.264/H.265 encode, and WebCodecs browser decode without requiring relay infrastructure.
+**On the same network.** If you SSH into a Mac at home or in the office, you can add `-L 6081:localhost:6081` to that command and open a browser tab. No client to install, no account to create, no relay.
 
 **Compliance-conscious teams.** TeamViewer, AnyDesk, and Chrome Remote Desktop route through third-party servers. If that's off-limits — SOC2, ISO 27001, air-gapped environments, or just principle — this runs entirely inside your existing SSH infrastructure.
 
@@ -255,17 +257,23 @@ macOS 15+ restricts unauthenticated VNC (type-2, no-auth) to view-only. Authenti
 
 ## Security
 
-### macOS password storage
+### macOS password storage — what `setup.sh` does, and when
 
-`setup.sh` prompts for your macOS login password to authenticate VNC and restart `screensharingd`. It writes this password into the LaunchAgent plist (`~/Library/LaunchAgents/com.macvncstream.server.plist`) so the background service can authenticate on reboot.
+The honest version: there are two install scenarios with different security shapes, and `setup.sh` adapts to which one you're in.
 
-**The preferred approach is to not store it there permanently.** Once Screen Recording and Accessibility are both granted, switch to `--api-only` mode — which never contacts `screensharingd` and needs no password at all. Edit the plist and remove the `MACOS_PASS` environment variable, then add `--api-only` to `ProgramArguments`. The server auto-starts without any stored credential from that point on.
+**Personal Macs (the common case): no password stored.** If `screensharingd` is already running (you've been using Screen Sharing locally) or if Screen Recording has already been granted to Python, `setup.sh` never asks for your login password. SCK is the capture path, the LaunchAgent runs without credentials, and there is nothing sensitive in the plist. This is what most users will see.
 
-If you run from SSH rather than as a persistent service, just pass credentials at runtime and skip the LaunchAgent entirely:
+**Cloud Macs (Scaleway, AWS EC2 Mac, MacStadium, Hetzner, headless rack-mounted CI Macs): password is in the plist, by design.** A Mac that you only reach over SSH cannot grant Screen Recording TCC interactively. The only working capture path is VNC via `screensharingd`, and `screensharingd`'s AppleDH authentication (the secure auth type macOS 15+ requires for full input control) needs your login password every time the server starts — not just once. Storing it in `~/Library/LaunchAgents/com.macvncstream.server.plist` is what makes the service survive a reboot.
+
+The plist is `0600`, owned by your user, and macOS already trusts your local user with that file (it lives next to many similar plists). The trade-off is: you accept that anyone with file-level access to your home directory could read it. On a throwaway cloud Mac that you control end-to-end and that's only reachable via SSH, this is the correct trade-off; on a shared multi-user box, it isn't.
+
+**Once permissions are granted, you can drop the password:** edit the plist, remove the `MACOS_PASS` environment variable, add `--api-only` to `ProgramArguments`. The server then runs with no stored credentials. This is the recommended end state for any Mac you control long-term.
+
+**Or skip the LaunchAgent entirely:**
 
 ```bash
 MACOS_PASS=xxx python3 server.py --macos-user alice --api-only
-# or, if VNC fallback is needed:
+# or, if VNC fallback is still needed:
 MACOS_PASS=xxx python3 server.py --macos-user alice --macos-pass "$MACOS_PASS"
 ```
 

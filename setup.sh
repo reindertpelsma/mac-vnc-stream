@@ -166,7 +166,17 @@ echo "  User: $MACOS_USER"
 if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
     # Cloud Mac: password needed for sudo (enable/restart screensharingd) and VNC auth.
     if [[ -z "$MACOS_PASS" ]]; then
-        read -rsp "  macOS password (used for sudo + VNC input control): " MACOS_PASS
+        echo
+        yellow "  This Mac uses VNC capture (screensharingd is already running, or"
+        yellow "  Screen Recording cannot be granted interactively over SSH)."
+        yellow "  AppleDH authentication is required by macOS 15+ for full input"
+        yellow "  control, and it needs your login password every time the server"
+        yellow "  starts. The password will be stored in:"
+        yellow "    ~/Library/LaunchAgents/com.macvncstream.server.plist  (mode 0600)"
+        yellow "  Once Screen Recording is granted, switch to --api-only and remove"
+        yellow "  MACOS_PASS from the plist (see README ▸ Security)."
+        echo
+        read -rsp "  macOS login password: " MACOS_PASS
         echo
     fi
     if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
@@ -394,10 +404,15 @@ cat > "$PLIST_PATH" <<PLIST
 </plist>
 PLIST
 
-green "  Plist written"
-yellow "  Note: MACOS_PASS is stored in the plist for VNC bootstrap."
-yellow "  Once Screen Recording is granted, switch to --api-only in the plist"
-yellow "  to remove the stored password (see README > Security)."
+green "  Plist written (mode 0600)"
+chmod 600 "$PLIST_PATH"
+if [[ -n "$MACOS_PASS" ]]; then
+    yellow "  Plist contains MACOS_PASS for VNC AppleDH auth (the only way macOS 15+"
+    yellow "  permits full input control via VNC). To stop storing it: grant Screen"
+    yellow "  Recording, then edit the plist to drop MACOS_PASS and add --api-only."
+else
+    green "  Plist contains no credentials — runtime uses SCK only"
+fi
 
 # ── Step 7: (Re)load the LaunchAgent ─────────────────────────────────────────
 step "Starting mac-vnc-stream service"

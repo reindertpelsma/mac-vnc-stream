@@ -4,7 +4,7 @@
 Run from the Mac (port 6081 is loopback-only):
   python3 test_keys.py
 
-debug_keylog.py window must be focused in the web UI before running.
+tests/keymap_capture.py window must be focused in the web UI before running.
 Results land in /tmp/keylog.txt.
 """
 import asyncio, json, time, sys
@@ -121,7 +121,7 @@ async def run():
             await combo(f"Option+{ch.upper()}", ALT, (ch, f"Key{ch.upper()}"))
 
         # ── Cmd + Shift + digit (screenshots — intercepted, won't fire system action
-        #    because debug_keylog's performKeyEquivalent_ returns True) ────────
+        #    because keymap_capture's performKeyEquivalent_ returns True) ──────
         print("\n=== Cmd+Shift+digit ===")
         for d in "345":
             await combo(f"Cmd+Shift+{d}", CMD, SHF, (d, f"Digit{d}"))
