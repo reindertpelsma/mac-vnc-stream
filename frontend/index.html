@@ -6,7 +6,8 @@
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#111;overflow:hidden}
-canvas{display:block;position:absolute}
+canvas{display:block;position:absolute;
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;-moz-user-select:none}
 #hud{position:fixed;top:6px;right:10px;color:#0f0;font:11px monospace;
   background:rgba(0,0,0,.7);padding:2px 8px;border-radius:3px;z-index:9;
   cursor:pointer;user-select:none}
@@ -187,6 +188,38 @@ let fitMode='fit';       // 'fit' = letterbox, 'cover' = fill/crop
 let ctrlToMeta=!navigator.userAgent.includes('Macintosh');
 let _ctrlRemapped={};    // tracks in-flight ctrl→meta remap for keyup pairing
 const _suppressedKd=new Set(); // keys whose keydown was intercepted; suppress matching keyup
+// Codes of keys we've sent kd for and not yet sent ku. Used by _syncMods to
+// detect modifier releases that the browser silently ate (Cmd+Tab, Cmd+Space,
+// system shortcut consumed the keyup, focus moved off ki between down and up).
+const _heldKeys=new Set();
+const _MOD_CODES={
+  Control:['ControlLeft','ControlRight'],
+  Shift:  ['ShiftLeft','ShiftRight'],
+  Alt:    ['AltLeft','AltRight'],
+  Meta:   ['MetaLeft','MetaRight'],
+};
+// Reconcile tracked-held modifiers with actual OS state on every event that
+// carries getModifierState (keyboard + pointer). For each modifier the OS
+// reports as released but we still think is held, send a synthetic ku so the
+// Mac side releases the corresponding flag. This is what prevents "stuck Ctrl"
+// after a system shortcut absorbs the release.
+function _syncMods(e){
+  if(!e||typeof e.getModifierState!=='function'||!wsOpen)return;
+  for(const name in _MOD_CODES){
+    if(e.getModifierState(name))continue;
+    for(const code of _MOD_CODES[name]){
+      if(!_heldKeys.has(code))continue;
+      _heldKeys.delete(code);
+      // Apply the same Ctrl→Meta remap on the way out (so the Mac sees the
+      // release of whatever it saw the press of).
+      const remap=_ctrlRemapped[code];
+      const sendCode=remap||code;
+      const sendKey=remap||name; // 'Control','Shift','Alt','Meta'
+      delete _ctrlRemapped[code];
+      send({t:'ku',k:sendKey,code:sendCode});
+    }
+  }
+}
 let _suppressReconnect=false,_hiddenTimer=null;  // tab visibility disconnect
 let _hideCursor=false;      // dock "Hide cursor" toggle
 let _plockActive=false;     // pointer lock engaged (real or emulated)
@@ -770,6 +803,7 @@ function toVNC(cx,cy){return[Math.round((cx-ox)*scaleX),Math.round((cy-oy)*scale
 function inBounds(vx,vy){return vx>=0&&vy>=0&&vx<_nativeW&&vy<_nativeH;}
 
 document.body.addEventListener('mousemove',e=>{
+  _syncMods(e); // catch modifier releases that the keyboard event stream missed
   if(_plockActive){
     // Pointer lock: use movementX/Y (relative) to update virtual Mac cursor position.
     // movementX/Y are in CSS pixels; scaleX/Y convert CSS→native coordinates.
@@ -783,6 +817,7 @@ document.body.addEventListener('mousemove',e=>{
   if(inBounds(vx,vy))send({t:'mm',x:vx,y:vy,b:mBtn});
 });
 canvas.addEventListener('mousedown',e=>{
+  _syncMods(e);
   mBtn|=(1<<e.button);cur.classList.add('dn');
   // In pointer lock mode clientX/Y are frozen; use virtual cursor position instead.
   const[vx,vy]=_plockActive?[Math.round(_plockVX),Math.round(_plockVY)]:toVNC(e.clientX,e.clientY);
@@ -966,6 +1001,7 @@ ki.addEventListener('keydown',async e=>{
   // Ctrl→Cmd: remap ControlLeft/Right → MetaLeft (Ctrl+A=Cmd+A, Ctrl+C=Cmd+C, etc.)
   if(ctrlToMeta&&!e.metaKey&&(code==='ControlLeft'||code==='ControlRight')){
     _ctrlRemapped[code]='MetaLeft';
+    _heldKeys.add(code); // tracked under physical code so _syncMods can release it
     code=key='MetaLeft';
     send({t:'kd',k:key,code:code});
     e.preventDefault(); // prevent browser Ctrl+key shortcuts (zoom, find, etc.)
@@ -985,23 +1021,30 @@ ki.addEventListener('keydown',async e=>{
   // event — Safari then never gets the text into its own clipboard, which
   // is the bug we're fixing here.
   if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='c'){
+    _heldKeys.add(e.code);
     send({t:'kd',k:key,code:code});
     return;
   }
+  _heldKeys.add(e.code);
   send({t:'kd',k:key,code:code});
   e.preventDefault();
+  // After our send, reconcile against the OS-reported modifier state so any
+  // modifier whose release we missed gets released to the Mac side now.
+  _syncMods(e);
 });
 ki.addEventListener('keyup',e=>{
   let code=e.code,key=e.key;
+  _heldKeys.delete(e.code);
   if(_ctrlRemapped[e.code]){code=key=_ctrlRemapped[e.code];delete _ctrlRemapped[e.code];}
   // Suppress keyup for any key whose keydown was intercepted (e.g. V after Ctrl+V paste).
   // Must check e.code (physical key) not key, because modifier state may have changed.
-  if(_suppressedKd.has(e.code)){_suppressedKd.delete(e.code);e.preventDefault();return;}
+  if(_suppressedKd.has(e.code)){_suppressedKd.delete(e.code);e.preventDefault();_syncMods(e);return;}
   // Belt-and-suspenders: also suppress if modifier still held (catches cases where
   // the keydown wasn't tracked but modifier is clearly still active).
-  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){e.preventDefault();return;}
+  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){e.preventDefault();_syncMods(e);return;}
   send({t:'ku',k:key,code:code});
   e.preventDefault();
+  _syncMods(e);
 });
 
 // Document-level paste fallback (when dock or other UI has focus)
@@ -1236,6 +1279,11 @@ clipTA.addEventListener('input',()=>{
 // ---------------------------------------------------------------------------
 document.addEventListener('visibilitychange',()=>{
   if(document.hidden){
+    // Tab hidden: keyup events for held modifiers won't fire while we're in
+    // the background, so flush server-side state now to avoid stuck-key on
+    // return. Same as the blur path; both fire on Cmd+Tab on macOS Safari.
+    if(wsOpen)send({t:'reset'});
+    _heldKeys.clear();_ctrlRemapped={};
     // Disconnect after 30s hidden to save bandwidth
     _hiddenTimer=setTimeout(()=>{
       if(document.hidden){
@@ -1257,6 +1305,7 @@ document.addEventListener('visibilitychange',()=>{
 });
 window.addEventListener('blur',()=>{
   if(wsOpen)send({t:'reset'});
+  _heldKeys.clear();_ctrlRemapped={};
 });
 // ---------------------------------------------------------------------------
 // Audio — opt-in, separate WebSocket, stays alive when tab is hidden
