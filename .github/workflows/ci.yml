@@ -40,32 +40,23 @@ jobs:
 
       - name: Drive screen activity for smoke test
         run: |
-          # Write a tight loop script that prints incrementing lines — Terminal
-          # scrolls it immediately, giving SCK a constantly-changing framebuffer.
-          # Terminal + AppleScript starts in under a second; Chrome takes 5-10s.
-          cat > /tmp/ci_animate.sh << 'EOF'
-          #!/bin/bash
-          i=0
-          while true; do
-            echo "ci frame $i"
-            i=$((i + 1))
-          done
-          EOF
-          osascript \
-            -e 'tell application "Terminal" to activate' \
-            -e 'tell application "Terminal" to do script "bash /tmp/ci_animate.sh"' \
-            2>/dev/null || true
-          # Continuous TTS loop — survives step boundary via nohup
+          # PyObjC color-cycling NSWindow at 60fps.
+          # Avoids osascript (blocks 2min on Terminal first launch) and Chrome
+          # (5-10s startup). PyObjC is already installed by the step above.
+          nohup python3 tests/ci_animate.py > /tmp/animate.log 2>&1 &
+          echo $! > /tmp/animate_pid
+          # Audio loop for the audio smoke test
           nohup bash -c 'while true; do say -v Samantha "audio test"; sleep 0.1; done' \
             > /tmp/say.log 2>&1 &
           echo $! > /tmp/say_pid
-          sleep 4
-          echo "Screen activity running (Terminal scrolling + audio loop)."
+          sleep 5
+          echo "Screen activity started (animate PID: $(cat /tmp/animate_pid))"
 
       - name: Run smoke tests (SCK video + audio)
         run: |
           python3 tests/ci_smoke.py 6081 citest
           STATUS=$?
+          kill "$(cat /tmp/animate_pid)" 2>/dev/null || true
           kill "$(cat /tmp/say_pid)" 2>/dev/null || true
           exit $STATUS
 
@@ -74,3 +65,5 @@ jobs:
         run: |
           echo "=== Server log ==="
           cat /tmp/macvncstream.log
+          echo "=== Animate log ==="
+          cat /tmp/animate.log 2>/dev/null || echo "(no animate log)"
