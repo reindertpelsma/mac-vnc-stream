@@ -174,22 +174,30 @@ fi
 # ── Step 3: Install Python dependencies ───────────────────────────────────────
 step "Installing Python dependencies"
 
-# User site-packages: no venv needed; LaunchAgent inherits user environment.
-"$PYTHON_BINARY" -m pip install --quiet --user \
+# Detect PEP 668 (Homebrew Python on macOS 13+) and add --break-system-packages
+# if needed. We still use --user so we don't touch the Homebrew-managed tree.
+_PIP_FLAGS="--quiet --user"
+if "$PYTHON_BINARY" -m pip install --quiet --user --dry-run pip 2>&1 \
+        | grep -q "externally-managed-environment"; then
+    _PIP_FLAGS="--quiet --user --break-system-packages"
+    yellow "  PEP 668 detected — adding --break-system-packages"
+fi
+
+"$PYTHON_BINARY" -m pip install $_PIP_FLAGS \
     'websockets>=13.0' \
     'numpy>=1.24' \
     'Pillow>=10.0' \
     'cryptography>=41.0' \
     || die "pip install failed — check network and pip"
 
-if "$PYTHON_BINARY" -m pip install --quiet --user 'av>=12.0' 2>/dev/null; then
+if "$PYTHON_BINARY" -m pip install $_PIP_FLAGS 'av>=12.0' 2>/dev/null; then
     green "  av (PyAV/H.264): installed"
 else
     yellow "  av not installed — falling back to JPEG (lower quality)"
     CODEC="jpeg"
 fi
 
-"$PYTHON_BINARY" -m pip install --quiet --user \
+"$PYTHON_BINARY" -m pip install $_PIP_FLAGS \
     pyobjc-core \
     pyobjc-framework-Cocoa \
     pyobjc-framework-Quartz \
