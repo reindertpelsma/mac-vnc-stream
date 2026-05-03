@@ -308,6 +308,59 @@ function startLagReporter(){} // no-op; reporter is inline in handleBinary
 
 const CODEC_NAMES={0:'jpeg',1:'h264',2:'h265',3:'av1'};
 
+// Video playback queue — used only when buffer mode is on (_qLagMs >= 100).
+// Each incoming frame is held for buffer_ms (wallclock) before being submitted
+// to the decoder. This is what gives "press play, see N seconds of pre-buffer
+// fill, then smooth playback always running N seconds behind real-time".
+// Audio uses AudioContext scheduling for the same effect — both sides land at
+// the same target latency so A/V stays aligned.
+const _vidQueue = [];   // [{codec, flags, capMs, payload, decodeAt(ms perf.now)}]
+let _vidScheduler = null;
+function _scheduleVideoFlush(){
+  if(_vidScheduler!==null) return;
+  function tick(){
+    _vidScheduler = null;
+    const now = performance.now();
+    while(_vidQueue.length && _vidQueue[0].decodeAt <= now){
+      const it = _vidQueue.shift();
+      _decodeNow(it.codec, it.flags, it.capMs, it.payload);
+    }
+    if(_vidQueue.length){
+      const dt = Math.max(1, _vidQueue[0].decodeAt - performance.now());
+      _vidScheduler = setTimeout(tick, dt);
+    }
+  }
+  tick();
+}
+function _flushVideoBufferImmediately(){
+  // Drain everything queued now (used when user switches OUT of buffer mode).
+  while(_vidQueue.length){
+    const it = _vidQueue.shift();
+    _decodeNow(it.codec, it.flags, it.capMs, it.payload);
+  }
+  if(_vidScheduler!==null){clearTimeout(_vidScheduler); _vidScheduler=null;}
+}
+function _decodeNow(codec, flags, capMs, payload){
+  if(codec===0||!useVideo){
+    createImageBitmap(new Blob([payload],{type:'image/jpeg'})).then(bmp=>{
+      setDim(bmp.width,bmp.height);
+      ctx.drawImage(bmp,0,0,canvas.width,canvas.height);bmp.close();
+      fc++;updateFps();
+    }).catch(()=>{});
+  }else{
+    initDecoder(codec);
+    if(decoder&&decoder.state==='configured'){
+      try{
+        decoder.decode(new EncodedVideoChunk({
+          type:(flags&1)?'key':'delta',
+          timestamp:capMs*1000,
+          data:new Uint8Array(payload)
+        }));
+      }catch(e){console.warn('decode:',e);}
+    }
+  }
+}
+
 function handleBinary(buf){
   if(buf.byteLength<18)return;
   rxBytes+=buf.byteLength;  // bandwidth tracking
@@ -326,32 +379,26 @@ function handleBinary(buf){
     ageWindow.push({ts:now,age});
     ageWindow=ageWindow.filter(e=>now-e.ts<5000);
     worstAge5s=ageWindow.length?Math.max(...ageWindow.map(e=>e.age)):0;
-    // Per-frame lag report, throttled to ≤10/s
+    // Per-frame lag report, throttled to ≤10/s.
+    // Note: this measures LINK lag (receipt - send), not display lag.
+    // In buffer mode the display is intentionally delayed; the server's
+    // congestion controller correctly sees only the link lag, which is
+    // what it needs to decide whether to back off the encoder.
     if(now-_lastLagReport>=100){
       _lastLagReport=now;
       send({t:'lag',age_ms:Math.round(age)});
     }
   }
 
-  if(codec===0||!useVideo){
-    // JPEG path
-    createImageBitmap(new Blob([payload],{type:'image/jpeg'})).then(bmp=>{
-      setDim(bmp.width,bmp.height);
-      ctx.drawImage(bmp,0,0,canvas.width,canvas.height);bmp.close();
-      fc++;updateFps();
-    }).catch(()=>{});
+  // Buffer mode: hold this frame for _qLagMs ms before decoding it.
+  // Responsive mode (default): decode immediately — preserves the existing
+  // path that's been tuned to perfection.
+  const bufMs = _qLagMs|0;
+  if(bufMs >= 100){
+    _vidQueue.push({codec, flags, capMs, payload, decodeAt: performance.now() + bufMs});
+    _scheduleVideoFlush();
   }else{
-    // H.264 / H.265 via WebCodecs
-    initDecoder(codec);
-    if(decoder&&decoder.state==='configured'){
-      try{
-        decoder.decode(new EncodedVideoChunk({
-          type:(flags&1)?'key':'delta',
-          timestamp:capMs*1000,
-          data:new Uint8Array(payload)
-        }));
-      }catch(e){console.warn('decode:',e);}
-    }
+    _decodeNow(codec, flags, capMs, payload);
   }
 }
 
@@ -504,17 +551,31 @@ function _populateCodecSelect(probed){
     _qCodec=cSel.value;_qSaveCookie();sendCaps();
   });
   lSel.addEventListener('change',()=>{
+    const old=_qLagMs;
     _qLagMs=parseInt(lSel.value)||0;_qSaveCookie();sendQuality();
+    if(old>=100 && _qLagMs<100){
+      // Switching buffered → responsive: flush queued video so the user
+      // immediately sees real-time. Without this, the next 3s would still
+      // play out of the queue.
+      _flushVideoBufferImmediately();
+    }
+    // Audio: force a reset on next packet so the scheduling lead changes
+    // to match the new target. _nextAudioTime=0 → next packet hits the
+    // underrun-reset branch and lands at now + new_target.
+    _nextAudioTime=0;
   });
   sSel.addEventListener('change',()=>{
     _scrollMul=parseFloat(sSel.value)||1;_qSaveCookie();
   });
   document.getElementById('q-reset').addEventListener('click',()=>{
+    const oldLag=_qLagMs;
     _qCapH=0;_qFps=0;_qBwKbps=25000;_qCodec='auto';_qLagMs=0;_scrollMul=1;
     document.cookie='mvs_q=;max-age=0;SameSite=Strict';
     rSel.value='0';fSel.value='0';bSel.value='25000';cSel.value='auto';lSel.value='0';sSel.value='1';
     sendQuality();
     sendCaps();
+    if(oldLag>=100)_flushVideoBufferImmediately();
+    _nextAudioTime=0;
     ki.focus();
   });
   document.getElementById('btn-fix').addEventListener('click',()=>send({t:'keyframe'}));
