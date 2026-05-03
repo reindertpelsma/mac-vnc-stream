@@ -2,6 +2,8 @@ import logging
 import threading
 import time
 
+from mvs.codec import CODEC_H264, CODEC_H265, CODEC_AV1
+
 log = logging.getLogger("macvnc")
 
 
@@ -37,6 +39,12 @@ class AdaptiveController:
         self._ping_smooth = 0.0     # EWA-smoothed video ping RTT (jitter suppression)
         self._ping_history = []     # last 4 smoothed samples for gradient computation
         self._metric_rtt = 0.0      # EWA of unloaded metric-channel RTT; 0 = not measured yet
+        # Codec auto-switch state. Lag samples drive the recommendation; cooldown
+        # prevents flapping. _last_drain_t tracks "is the link absorbing
+        # everything?" — if drain pauses fire, the answer is no.
+        self._lag_samples = []          # rolling 30s window of (mono_t, age_ms)
+        self._codec_switch_cooldown = 0.0
+        self._last_drain_t = 0.0
 
     @property
     def draining(self):
@@ -150,6 +158,16 @@ class AdaptiveController:
 
     def on_lag(self, age_ms, write_buf=0):
         budget = self.lag_budget_ms()
+        # Record lag sample for codec recommendation regardless of severity.
+        # We want the FULL distribution, not just severe events, so that
+        # sustained-low-lag conditions are visible to recommend_codec.
+        if age_ms > 0:
+            with self._lock:
+                now = time.monotonic()
+                self._lag_samples.append((now, age_ms))
+                cutoff = now - 30.0
+                if self._lag_samples and self._lag_samples[0][0] < cutoff:
+                    self._lag_samples = [(t, a) for t, a in self._lag_samples if t > cutoff]
         if age_ms > 0 and age_ms < budget and write_buf < self.lag_wb_budget():
             return
         if age_ms == 0 and write_buf < self.lag_wb_budget():
@@ -178,6 +196,7 @@ class AdaptiveController:
                 wb_pause  = (write_buf * 8) / max(self.bitrate, 1)
                 pause_s = min(5.0, max(age_pause, wb_pause))
                 self._drain_until = time.monotonic() + pause_s
+                self._last_drain_t = time.monotonic()
                 log.debug("drain pause: %.0fms (age=%.0fms wb=%dKB budget=%.0fms)",
                           pause_s * 1000, age_ms, write_buf // 1024, budget)
 
@@ -312,3 +331,71 @@ class AdaptiveController:
     def snapshot(self):
         with self._lock:
             return self.fps, self.bitrate, self.jpeg_quality
+
+    def recommend_codec(self, current, available):
+        """Return a codec id to switch to (CODEC_H264/H265/AV1), or None to
+        keep the current codec.
+
+        Policy (lag-based, no hardcoded bitrate thresholds):
+
+          DOWNSHIFT  HighEff → H.264 CBR
+            Trigger: 75th-percentile lag over last 5s exceeds 500ms.
+            Reasoning: a high-efficiency codec (HEVC/AV1) on VideoToolbox
+            does not respect strict bitrate (Apple-specific gap, see
+            encoder.py). When its overshoot is filling the pipe faster
+            than the link drains, lag climbs. H.264 with constant_bit_rate=1
+            is the refuge — Apple-blessed strict CBR.
+
+          UPSHIFT  H.264 → HighEff
+            Trigger: 75th-percentile lag over last 30s under 100ms,
+                 AND no drain pause has fired in the last 60s.
+            Reasoning: condition 1 says the link is healthy; condition 2
+            says the link has been absorbing everything we're sending
+            without needing a drain. Both together = HEVC's overshoot
+            should be tolerable. Probe model: if HEVC overshoot does
+            hurt, downshift kicks back in within 5s.
+
+          COOLDOWN: 30s minimum between switches (prevent flapping).
+          DISABLED if `available` doesn't include both H.264 and a HighEff codec.
+
+        HighEff selection priority: AV1 > HEVC. The encoder layer will
+        fall back if AV1 isn't actually encodable on this server.
+        """
+        h264_available = CODEC_H264 in available
+        high_eff = (CODEC_AV1 if CODEC_AV1 in available
+                    else CODEC_H265 if CODEC_H265 in available
+                    else None)
+        if not (h264_available and high_eff):
+            return None
+
+        now = time.monotonic()
+        if now < self._codec_switch_cooldown:
+            return None
+
+        with self._lock:
+            samples = list(self._lag_samples)
+        if len(samples) < 5:
+            return None  # not enough data to decide
+
+        def _pct75(window_s: float) -> float:
+            window = [a for t, a in samples if t > now - window_s]
+            if not window:
+                return 0.0
+            window.sort()
+            return window[int(len(window) * 0.75)]
+
+        # DOWNSHIFT
+        if current == high_eff:
+            if _pct75(5.0) > 500.0:
+                self._codec_switch_cooldown = now + 30.0
+                return CODEC_H264
+
+        # UPSHIFT
+        if current == CODEC_H264:
+            recently_drained = (self._last_drain_t > 0
+                                and (now - self._last_drain_t) < 60.0)
+            if not recently_drained and _pct75(30.0) < 100.0:
+                self._codec_switch_cooldown = now + 30.0
+                return high_eff
+
+        return None
