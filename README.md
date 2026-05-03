@@ -150,6 +150,18 @@ Measured on a Mac mini M1/M2 over localhost SSH tunnel:
 
 H.264/H.265 encoding uses Apple VideoToolbox (hardware media engine) — near-zero CPU.
 
+### Browser compatibility
+
+| Browser | Video codec | Audio | Clipboard sync | Notes |
+|---------|------------|-------|---------------|-------|
+| Chrome 110+ | H.264, H.265, AV1 | ✅ | Full (live sync) | Best overall experience |
+| Firefox 130+ | H.264 | ✅ | Read-only (Ctrl+V) | No H.265 WebCodecs |
+| Safari 26+ | H.265, H.264 | ✅ | Read-only (Ctrl+V) | H.265 selected automatically |
+| Mobile Chrome | H.264 | ✅ | Partial | Touch events supported |
+| Mobile Safari | H.264, H.265 | ✅ | Read-only | Touch events supported |
+
+The server negotiates the best codec the browser reports it supports. JPEG fallback is used only when WebCodecs is unavailable (rare).
+
 ### Tip: keep the screen non-static for best responsiveness
 
 macOS's WindowServer throttles the display compositor to ~3Hz when nothing is animating on screen. This causes 500ms–3s of first-keystroke latency — you type a character, the compositor is asleep, SCK has nothing to capture.
