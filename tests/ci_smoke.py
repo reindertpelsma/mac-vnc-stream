@@ -16,7 +16,7 @@ TOKEN   = sys.argv[2] if len(sys.argv) > 2 else ""
 WS_URL  = f"ws://{HOST}:{PORT}/" + (f"?token={TOKEN}" if TOKEN else "")
 AUD_URL = f"ws://{HOST}:{PORT}/audio" + (f"?token={TOKEN}" if TOKEN else "")
 
-MIN_FRAMES          = 240  # in 8s — 30fps minimum; Chrome bouncing-ball drives SCK
+MIN_FRAMES          = 120  # in 8s — 15fps minimum; GitHub VM compositor runs ~21fps
 MIN_AUDIO_PKTS      = 10   # total packets in 5s (includes DTX silence)
 MIN_REAL_AUDIO_PKTS = 30   # non-DTX packets — proves real audio is captured, not just silence
 
