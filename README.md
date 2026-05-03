@@ -127,7 +127,6 @@ All flags can be set via CLI or environment variable:
 | **Copy from Mac** | Mac clipboard syncs to browser automatically (Chrome: live sync; Firefox/Safari: Ctrl+V fallback) |
 | Fullscreen | F11 or the fullscreen button |
 | **Audio** | **Click the Audio button — streams system audio via Opus 128kbps** |
-| Mobile | Touch events: tap, drag, pinch |
 
 ### Clipboard in detail
 
@@ -158,10 +157,7 @@ The frame rate jump comes from switching capture backends (screensharingd is cap
 | Chrome 110+ | H.264, H.265, AV1 | ✅ | Full (live sync) | AV1 hardware requires M3+/A17 Pro |
 | Firefox 130+ | H.264 | ✅ | Read-only (Ctrl+V) | No H.265 WebCodecs |
 | Safari 26+ | H.265, H.264 | ✅ | Read-only (Ctrl+V) | H.265 selected automatically |
-| Mobile Chrome | H.264 | ⚠️ | Partial | Touch events supported; audio suspends when tab is backgrounded |
-| Mobile Safari | H.264, H.265 | ⚠️ | Read-only | Touch events supported; audio suspends when tab is backgrounded |
-
-The server negotiates the best codec the browser reports it supports. JPEG fallback is used only when WebCodecs is unavailable (rare). Mobile browsers aggressively suspend audio playback when the tab loses focus — audio is unreliable for background use on mobile.
+The server negotiates the best codec the browser reports it supports. JPEG fallback is used only when WebCodecs is unavailable (rare).
 
 ### Tip: keep the screen non-static for best responsiveness
 
