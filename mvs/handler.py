@@ -100,10 +100,6 @@ async def client_session(ws, cfg, bridge):
     target_codec = CODEC_H264 if cfg.codec == "h264" else CODEC_H265
     encoder = EncoderPipeline(CODEC_JPEG, W, H, ctrl.bitrate)  # JPEG until caps received
     has_webcodecs = False
-    # Codecs the browser said it can decode — used by the auto-switch logic
-    # so we never recommend a codec the client can't display.
-    client_codec_set: set = set()
-    _client_explicit = False    # True if user pinned a codec via the quality menu
     _enc_target_w, _enc_target_h = W, H  # current encoder dimensions
     _reinit_deadline = 0.0                # monotonic: reinit encoder at this time; 0=none
     _codec_error_msg = None               # set by _upgrade_encoder on explicit codec failure
@@ -174,7 +170,6 @@ async def client_session(ws, cfg, bridge):
 
     async def input_reader():
         nonlocal has_webcodecs, target_codec, _reinit_deadline, _codec_error_msg, _need_keyframe, _last_lag_received
-        nonlocal client_codec_set, _client_explicit
         cur_buttons = 0
         try:
             async for raw in ws:
@@ -190,11 +185,6 @@ async def client_session(ws, cfg, bridge):
                         has_webcodecs = bool(ev.get("webcodecs", False))
                         client_codecs = ev.get("codecs", [])
                         explicit = bool(ev.get("explicit", False))
-                        _client_explicit = explicit
-                        # Cache supported codec id set for the auto-switch logic.
-                        from mvs.codec import _CLIENT_CODEC_MAP
-                        client_codec_set = {_CLIENT_CODEC_MAP[c] for c in client_codecs
-                                            if c in _CLIENT_CODEC_MAP}
                         w, h = int(ev.get("w", 1920)), int(ev.get("h", 1080))
                         ctrl.on_resolution(w, h)
                         # Negotiate codec: pick best that client supports.
@@ -405,28 +395,9 @@ async def client_session(ws, cfg, bridge):
                     _vnc_fps = (_vnc_n - _last_vnc_fbu) / dt; _last_vnc_fbu = _vnc_n
                     _fb_age = int(time.time() * 1000) - bridge._fb_ms
                     await ws.send(json.dumps({"t": "stale", "ms": _fb_age}))
-                    log.info("DIAG: sent=%d/%.1fs=%.1ffps drop_wb=%d nosend=%d ctrl_fps=%.1f ctrl_br=%dk vnc=%.1ffps fb_age=%dms drain=%s codec=%s",
-                             _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, ctrl.bitrate // 1000, _vnc_fps, _fb_age, ctrl.draining,
-                             {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1",CODEC_JPEG:"jpeg"}.get(encoder.actual_codec, "?"))
+                    log.info("DIAG: sent=%d/%.1fs=%.1ffps drop_wb=%d nosend=%d ctrl_fps=%.1f ctrl_br=%dk vnc=%.1ffps fb_age=%dms drain=%s",
+                             _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, ctrl.bitrate // 1000, _vnc_fps, _fb_age, ctrl.draining)
                     _n_diag = _n_drop = _n_nosend = 0
-
-                    # Auto codec switch — only if client didn't pin a codec.
-                    # Lag-based recommendation (no hardcoded bitrate thresholds);
-                    # see ctrl.recommend_codec() for the full policy. The
-                    # encoder rebuild path produces a fresh I-frame on the
-                    # next encode, which is the unavoidable cost of switching
-                    # codec mid-stream (H.264 ↔ HEVC reference frames are
-                    # incompatible — different motion-compensation filters
-                    # and quantization patterns).
-                    if has_webcodecs and not _client_explicit and client_codec_set:
-                        rec = ctrl.recommend_codec(target_codec, client_codec_set)
-                        if rec is not None and rec != target_codec:
-                            log.info("auto codec switch: %s → %s (lag-based)",
-                                     {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1"}.get(target_codec,"?"),
-                                     {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1"}.get(rec,"?"))
-                            target_codec = rec
-                            _upgrade_encoder(explicit=False)
-                            _need_keyframe = True
                 fps, bitrate, jq = ctrl.snapshot()
                 interval = 1.0 / max(1.0, fps)
 
