@@ -655,8 +655,20 @@ async def client_session(ws, cfg, bridge):
     _dbg_seq = [0]
 
     async def dbg_sender():
+        # Race queue.get() with ws closing, so this task exits when the
+        # connection dies instead of leaking forever (was the cause of
+        # _dbg_eval_sessions ending up with N stale entries after N
+        # disconnect cycles).
         while True:
-            js = await dbg_q.get()
+            try:
+                js = await dbg_q.get()
+            except Exception:
+                break
+            try:
+                if ws.state.name != "OPEN":
+                    break
+            except Exception:
+                pass
             _dbg_seq[0] += 1
             try:
                 await ws.send(json.dumps({"t": "eval", "js": js, "id": _dbg_seq[0]}))
@@ -666,21 +678,30 @@ async def client_session(ws, cfg, bridge):
     async def ping_monitor():
         """RFC 6455 WebSocket pings as congestion signal.
         Ping frames queue behind video data frames, so rising RTT means the
-        TCP send buffer is building — earlier warning than JS age_ms reports."""
+        TCP send buffer is building — earlier warning than JS age_ms reports.
+
+        IMPORTANT: a slow pong is NOT a dead connection. On a 2Mbps Chrome
+        DevTools throttle the pong can legitimately arrive 5–15s late while
+        video is still flowing. Closing on timeout produced a 7-second
+        disconnect-loop in real Chrome. The connection-liveness signals
+        are the browser-side 15s stall detector and the websockets library's
+        own 20s/20s keepalive; this monitor is purely informational."""
         while True:
             await asyncio.sleep(2.0)
             t0 = time.monotonic()
             try:
                 pong_waiter = await ws.ping()
-                await asyncio.wait_for(pong_waiter, timeout=5.0)
+                # Generous timeout: this is a congestion signal, not liveness.
+                # On a constrained link the pong can be many seconds behind.
+                await asyncio.wait_for(pong_waiter, timeout=30.0)
                 rtt_ms = (time.monotonic() - t0) * 1000
                 ctrl.on_ping_rtt(rtt_ms)
                 log.debug("ping rtt=%.1fms metric=%.1fms", rtt_ms, ctrl._metric_rtt)
             except asyncio.TimeoutError:
-                log.warning("ping timeout %s — closing stale connection", ws.remote_address)
-                try: await ws.close()
-                except Exception: pass
-                break
+                # Don't close — feed it as a strong lag signal instead so
+                # the controller backs off, but keep the connection alive.
+                log.debug("ping rtt >30s for %s — feeding as congestion", ws.remote_address)
+                ctrl.on_lag(30000.0, 0)
             except Exception as e:
                 log.debug("ping err: %s", e)
                 break
