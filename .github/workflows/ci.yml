@@ -59,15 +59,16 @@ jobs:
       - name: Run 2Mbps stability test
         run: |
           # Simulates a Chrome DevTools 2Mbps throttle via virtual-clock pacing.
-          # Pass criteria (with stress animation still running):
+          # ci_animate's 50-ball stress is tuned to demand more bitrate than the
+          # 2Mbps cap, forcing the controller into the saturation region. The
+          # contract is then: encoder compresses harder, fps stays at 20.
+          # Pass criteria:
           #   - no disconnect
           #   - steady-state lag < 2000ms (after 10s warmup)
           #   - avg fps >= 20  (screen remains responsive — exempted if CPU is bottleneck)
-          #   - avg link >= 1.0Mbps  (controller found equilibrium, not stuck at floor)
-          # Mac mini M1 hits ~1.94Mbps; GH macos-14 runner caps near 1.2Mbps because
-          # the virtualised compositor delivers smaller per-frame residuals — 1.0Mbps
-          # is the meaningful "not collapsed" threshold for the runner shape.
-          python3 tests/test_2mbps.py 6081 citest 20 1.0
+          #   - avg link >= 1.7Mbps  (controller pushed near the 2Mbps cap because
+          #                           demand exceeds it; "not stuck at floor")
+          python3 tests/test_2mbps.py 6081 citest 20 1.7
 
       - name: Stop screen activity
         if: always()

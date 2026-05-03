@@ -31,7 +31,10 @@ except ImportError:
 
 random.seed(42)   # reproducible layout across runs
 
-NUM_BALLS    = 15
+NUM_BALLS    = 50    # tuned to push raw encoded bytes past 2Mbps so the
+                     # controller is forced into the saturation region; the
+                     # 2Mbps test then proves encoder compresses harder rather
+                     # than dropping frames (fps stays at 20).
 TICK_HZ      = 60
 
 app = AppKit.NSApplication.sharedApplication()
