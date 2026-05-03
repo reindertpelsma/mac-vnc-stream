@@ -292,6 +292,9 @@ cat > "$PLIST_PATH" <<PLIST
 PLIST
 
 green "  Plist written"
+yellow "  Note: MACOS_PASS is stored in the plist for VNC bootstrap."
+yellow "  Once Screen Recording is granted, switch to --api-only in the plist"
+yellow "  to remove the stored password (see README > Security)."
 
 # ── Step 7: (Re)load the LaunchAgent ─────────────────────────────────────────
 step "Starting mac-vnc-stream service"

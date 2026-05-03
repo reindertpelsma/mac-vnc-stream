@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""keylogger.py — key event logger for mac-vnc-stream keyboard testing.
+"""debug_keylog.py — key event logger for mac-vnc-stream keyboard testing.
 
 Logs every key event to /tmp/keylog.txt with full modifier and keycode details.
 All command-key shortcuts (Cmd+Q, Cmd+H, Cmd+M, etc.) are intercepted and

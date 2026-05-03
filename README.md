@@ -68,6 +68,13 @@ Browser                    Python server              macOS APIs
 bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
 ```
 
+If you prefer to review the script before running it:
+```bash
+git clone https://github.com/reindertpelsma/mac-vnc-stream.git
+cd mac-vnc-stream
+bash setup.sh
+```
+
 Then on your laptop:
 ```bash
 ssh -L 6081:localhost:6081 user@your-mac
@@ -221,6 +228,38 @@ In `--api-only` mode, screensharingd is never contacted. If both Screen Recordin
 | 26 Tahoe | ✅ | ✅ | ✅ |
 
 macOS 15+ restricts unauthenticated VNC (type-2, no-auth) to view-only. Authenticated VNC with a macOS username and password retains full input control. `setup.sh` prompts for your login password during install and passes it automatically — VNC input works out of the box for most users. CGEvent input is unaffected either way; it uses the Accessibility API directly and is the preferred input path.
+
+---
+
+## Security
+
+### macOS password storage
+
+`setup.sh` prompts for your macOS login password to authenticate VNC and restart `screensharingd`. It writes this password into the LaunchAgent plist (`~/Library/LaunchAgents/com.macvncstream.server.plist`) so the background service can authenticate on reboot.
+
+**The preferred approach is to not store it there permanently.** Once Screen Recording and Accessibility are both granted, switch to `--api-only` mode — which never contacts `screensharingd` and needs no password at all. Edit the plist and remove the `MACOS_PASS` environment variable, then add `--api-only` to `ProgramArguments`. The server auto-starts without any stored credential from that point on.
+
+If you run from SSH rather than as a persistent service, just pass credentials at runtime and skip the LaunchAgent entirely:
+
+```bash
+MACOS_PASS=xxx python3 server.py --macos-user alice --api-only
+# or, if VNC fallback is needed:
+MACOS_PASS=xxx python3 server.py --macos-user alice --macos-pass "$MACOS_PASS"
+```
+
+Environment variables passed at the command line are not written to disk.
+
+### Access token
+
+The token travels in the URL query string (`?token=…`). This is safe when accessed over an SSH tunnel to `localhost` — SSH encrypts the connection end-to-end. Do not use `--listen 0.0.0.0` without adding HTTPS in front, as the token will appear in server logs and browser history in plaintext.
+
+### Uninstalling
+
+```bash
+launchctl bootout "gui/$(id -u)/com.macvncstream.server"
+rm ~/Library/LaunchAgents/com.macvncstream.server.plist
+rm -rf ~/mac-vnc-stream
+```
 
 ---
 
