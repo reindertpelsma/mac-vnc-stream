@@ -416,7 +416,8 @@ async def client_session(ws, cfg, bridge):
                 if wb > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, wb)
                     _n_drop += 1
-                    _need_keyframe = True
+                    if has_webcodecs:
+                        _need_keyframe = True
                     if _pipe_task is not None:
                         try: await _pipe_task
                         except Exception: pass
@@ -511,7 +512,8 @@ async def client_session(ws, cfg, bridge):
                     if wb > ctrl.lag_wb_budget():
                         ctrl.on_lag(0, wb)
                         _n_drop += 1
-                        _need_keyframe = True
+                        if has_webcodecs:
+                            _need_keyframe = True
                         if _pipe_task is not None:
                             try: await _pipe_task
                             except Exception: pass
@@ -553,24 +555,31 @@ async def client_session(ws, cfg, bridge):
                 if _get_wbuf(ws) > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, _get_wbuf(ws))
                     _n_drop += 1
-                    if not is_kf:
+                    if has_webcodecs:
                         _need_keyframe = True
                     continue
 
                 last_send_time = target
                 _last_encoded_seq = _pipe_enc_seq
-                # Enforce user bandwidth cap: drop frame if rolling 1s window is over budget.
-                # This applies to all codecs including JPEG (which ignores the bitrate setting).
+                # Enforce user bandwidth cap via rolling 1s window.
+                # JPEG only: each frame is independent, so dropping is safe.
+                # Video codecs (H.264/H.265/AV1): never drop here. The encoder's
+                # CBR already targets user_bw_cap; dropping an encoded P-frame
+                # after encode() has run desynchronises encoder ↔ decoder reference
+                # frames and produces the block-echo corruption. Trust VideoToolbox
+                # CBR to stay within budget; write-buffer monitoring handles genuine
+                # network congestion independently.
                 _bw_cap_bps = ctrl.user_bw_cap
                 if _bw_cap_bps:
                     _bw_now = time.monotonic()
                     _bw_sent = [(t, b) for t, b in _bw_sent if t > _bw_now - 1.0]
                     _frame_bytes = 18 + len(payload)  # 18 = struct.calcsize(">IQBBI")
                     if (sum(b for _, b in _bw_sent) + _frame_bytes) * 8 > _bw_cap_bps:
-                        _n_drop += 1
-                        if not is_kf:
-                            _need_keyframe = True
-                        continue
+                        if has_webcodecs:
+                            pass  # video: send anyway, encoder CBR self-corrects
+                        else:
+                            _n_drop += 1
+                            continue  # JPEG: safe to drop, no reference frames
                     _bw_sent.append((_bw_now, _frame_bytes))
                 _n_diag += 1
                 seq_num += 1
