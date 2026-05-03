@@ -407,6 +407,24 @@ async def client_session(ws, cfg, bridge):
                     fps = min(fps, float(ctrl.fps_cap))
                 interval = 1.0 / max(1.0, fps)
 
+                # Hard fps-cap enforcement. Without this clamp, two paths leak:
+                #  (1) the static→active recovery at line below sets
+                #      last_send_time = now - interval, and on actively-
+                #      changing content a 1-poll static blip can happen
+                #      between captures; each blip fires that line and
+                #      drops a frame in immediately, regardless of fps_cap;
+                #  (2) when one encode runs longer than `interval`,
+                #      `last_send_time = target` advances by `interval`
+                #      but real time advanced more — subsequent iters see
+                #      to_sleep<0 and burst frames to "catch up."
+                # Both paths bypass the rate limit. Clamping last_send_time
+                # so it can never lag more than one interval behind real
+                # time means target = last+interval ≥ now always, so
+                # to_sleep ≥ 0 and we send at most one frame per interval.
+                _now_mono = time.monotonic()
+                if last_send_time < _now_mono - interval:
+                    last_send_time = _now_mono - interval
+
                 # Proactive backoff: lag reports travel browser→server (upload direction) and
                 # usually arrive within RTT (~20ms). If they go silent for >500ms while we're
                 # actively sending, the download buffer is backed up to the point where the
