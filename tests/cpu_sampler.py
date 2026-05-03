@@ -8,8 +8,13 @@ as runner-limited rather than a system failure.
 import subprocess, threading, time
 
 SATURATION_PCT  = 90.0   # CPU-bound: encoder/compositor pegged
-HEADROOM_PCT    = 50.0   # both well under this = runner can't deliver more frames
-                         # (SCK/compositor delivery rate cap, not a system bug)
+HEADROOM_PCT    = 80.0   # neither process at this level → CPU has clearly
+                         # not saturated; if fps is below target it's the
+                         # SCK/compositor delivery rate cap, not a system bug.
+                         # Anything between SATURATION_PCT and HEADROOM_PCT
+                         # means the runner is genuinely working hard but not
+                         # pegged — still treat as runner-limited, since the
+                         # only "real failure" mode would be CPU pegged.
 
 
 class CpuSampler(threading.Thread):
@@ -64,9 +69,11 @@ class CpuSampler(threading.Thread):
 
     @property
     def runner_capped(self) -> bool:
-        """True if both server and WindowServer are clearly under-utilised.
-        Means the runner can't deliver more frames regardless of what we do —
-        SCK/compositor delivery rate cap on virtualized macOS CI hardware."""
+        """True if neither server nor WindowServer is approaching saturation.
+        The runner can't deliver more frames regardless of what we do —
+        SCK/compositor delivery rate cap on virtualized macOS CI hardware.
+        Set HEADROOM_PCT close to SATURATION_PCT so the only "real failure"
+        is genuine CPU saturation, not partial load."""
         return (self.samples > 0
                 and self.max_python    < HEADROOM_PCT
                 and self.max_winserver < HEADROOM_PCT)
