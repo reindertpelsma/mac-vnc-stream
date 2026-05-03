@@ -840,25 +840,51 @@ function sendPasteText(text){
 }
 
 // Write text to the browser's local clipboard.
-// Tries the modern async API first; falls back to the deprecated execCommand path
-// which works without permission in all major browsers.
+//
+// Safari (and to some extent Firefox) blocks navigator.clipboard.writeText()
+// outside a user-gesture context. WS messages arrive on a background task,
+// so the direct call rejects with NotAllowedError. document.execCommand('copy')
+// has the same restriction in Safari, so the legacy fallback isn't useful.
+//
+// Strategy: try the direct call (works on Chrome immediately). If it rejects
+// (Safari path), queue the text and flush on the next user gesture — any
+// pointerdown/keydown re-runs writeText with that gesture authorising the
+// call. The newest-wins queue handles rapid Mac-side clipboard changes.
+let _pendingClipWrite = '';
 function _writeClipboard(text){
+  if(!text)return;
   if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).catch(()=>_legacyCopy(text));
+    navigator.clipboard.writeText(text).catch(()=>{_pendingClipWrite=text;});
   }else{
-    _legacyCopy(text);
+    _pendingClipWrite=text;
   }
 }
-function _legacyCopy(text){
-  const ta=document.createElement('textarea');
-  ta.value=text;
-  ta.style.cssText='position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
-  document.body.appendChild(ta);
-  ta.focus();ta.select();
-  try{document.execCommand('copy');}catch(e){}
-  document.body.removeChild(ta);
-  ki.focus(); // restore VNC keyboard focus
+function _flushPendingClipWrite(){
+  if(!_pendingClipWrite)return;
+  if(!navigator.clipboard||!navigator.clipboard.writeText)return;
+  const t=_pendingClipWrite;
+  _pendingClipWrite='';
+  navigator.clipboard.writeText(t).catch(()=>{
+    // Permission still denied — re-queue (only if newer text didn't arrive).
+    if(!_pendingClipWrite)_pendingClipWrite=t;
+  });
 }
+// Capture-phase so the flush runs even if the inner handler stops propagation.
+['pointerdown','keydown','focus'].forEach(ev=>
+  window.addEventListener(ev,_flushPendingClipWrite,true));
+
+// Cmd+C / Ctrl+C path: Safari fires a native copy event on the focused ki
+// textarea (because keydown didn't preventDefault — see handler above). The
+// copy event runs in a user-gesture context, so setData() always succeeds.
+// We override clipboardData with the latest Mac clipboard text so that the
+// user can paste it anywhere — including back into the host macOS that's
+// running Safari (its system clipboard tracks Safari's clipboard).
+document.addEventListener('copy',e=>{
+  if(_lastMacClipboard&&e.clipboardData){
+    e.clipboardData.setData('text/plain',_lastMacClipboard);
+    e.preventDefault();
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Async clipboard permission + bidirectional sync (browser-agnostic)
@@ -951,6 +977,16 @@ ki.addEventListener('keydown',async e=>{
   if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){
     _suppressedKd.add(e.code); // suppress matching keyup
     return; // don't send V to VNC; paste event handles the rest
+  }
+  // Cmd+C / Ctrl+C: forward to Mac (so the remote app copies its selection
+  // into the Mac clipboard) AND let the native copy event fire on ki so
+  // the document copy listener can populate Safari's local clipboard with
+  // _lastMacClipboard. preventDefault() would suppress the native copy
+  // event — Safari then never gets the text into its own clipboard, which
+  // is the bug we're fixing here.
+  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='c'){
+    send({t:'kd',k:key,code:code});
+    return;
   }
   send({t:'kd',k:key,code:code});
   e.preventDefault();
