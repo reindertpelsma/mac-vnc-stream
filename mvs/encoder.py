@@ -23,15 +23,14 @@ class EncoderPipeline:
     def _setup(self, width, height, bitrate):
         if not _AV_OK or self.target_codec == CODEC_JPEG:
             return
-        # VideoToolbox CBR. Dynamic range is preserved by the controller's
-        # bitrate target ramping from 300kbps to 50Mbps based on link
-        # health — CBR just enforces strict adherence to whatever target
-        # the controller picked, so a constrained link doesn't get
-        # overrun by VBR bursts (the cause of the 2Mbps Chrome-throttle
-        # disconnect: VBR would produce 4-6Mbps on real-video content
-        # while the controller asked for 2Mbps, queue grew to 10s of lag,
-        # write buffer hit the 4MB hard-kill threshold).
-        _vt_opts = {"realtime": "1", "allow_sw": "1", "constant_bit_rate": "1"}
+        # VideoToolbox VBR (constant_bit_rate=0). CBR was tried and rejected:
+        # on simple content the encoder collapsed to ~10% of target rather
+        # than padding, killing dynamic range on the upside. VBR + the
+        # drain-pause / wb-aware backoff in congestion.py is the better
+        # combination — the encoder is allowed to use efficient compression
+        # on simple frames, and overshoots on complex frames are handled
+        # by the controller's wb-aware drain logic.
+        _vt_opts = {"realtime": "1", "allow_sw": "1", "constant_bit_rate": "0"}
         candidates = {
             CODEC_H264: [
                 ("h264_videotoolbox", _vt_opts),
