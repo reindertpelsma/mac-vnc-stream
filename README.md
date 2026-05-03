@@ -20,7 +20,7 @@ open "http://localhost:6081/?token=YOUR_TOKEN"
 
 Every browser-based macOS remote desktop tool has the same problems:
 
-- **noVNC over websockify runs at 2fps on macOS.** ZRLE decoding in JavaScript takes 400–500ms per frame regardless of network speed.
+- **noVNC over websockify runs at 2fps on macOS.** ZRLE decoding in JavaScript takes 400–500ms per frame regardless of network speed. The VNC protocol itself is fine; the bottleneck is running the decoder in the browser's JS engine without hardware acceleration.
 - **screensharingd is unreliable.** It freezes, enters HID-idle and stops updating its framebuffer, and silently breaks clipboard and key mapping after reconnects.
 - **Clipboard doesn't work.** VNC's `ClientCutText` is silently ignored on macOS 15+. Browser clipboard APIs are blocked on most browsers without user interaction.
 - **Key mapping is broken.** Cmd vs Ctrl, Option, and modifier state all behave differently across VNC clients. Modifier keys get stuck after reconnects.
@@ -29,7 +29,7 @@ This tool solves all of it by going below screensharingd:
 
 | Problem | Solution |
 |---------|----------|
-| 2fps ZRLE | ScreenCaptureKit (SCK) captures directly from GPU compositor at 60fps |
+| 2fps ZRLE (JS) | Server decodes ZRLE in Python, re-encodes as H.264/H.265, browser uses WebCodecs hardware decode; primary path uses SCK directly at 60fps |
 | screensharingd freezes | Watchdog auto-restarts it within 5s; CGEvent input doesn't need it at all |
 | Broken clipboard | pbpaste polling + native browser paste event; no permission required |
 | Broken key mapping | CGEvent keyboard injection with Mac virtual key codes; bypasses VNC keysym translation entirely |
