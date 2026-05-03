@@ -171,6 +171,19 @@ fills with high-quality frames, which is exactly what cinema mode wants.
 
 ## Things that probably WILL work, not yet attempted
 
+- **Token-bucket BW enforcer** for "Max BW" being a *hard* cap rather
+  than the current soft 0.65× scale. The encoder target stays at
+  `user_bw_cap × 0.65`, but a token bucket on the WS sender meters
+  outgoing bytes at `user_bw_cap` (with ~200ms burst budget = 1.2×
+  user_bw_cap). Before `await ws.send(hdr + payload)`, consume
+  `len(payload)` tokens; if insufficient, sleep until the bucket
+  refills. Same algorithm as `tests/tcp_throttle.py`. Useful for 4G
+  / cellular users who want a strict consumption budget like Chrome
+  DevTools throttle gives. Side effect: a small server-side queue
+  forms during overshoot, the existing lag-report path sees it and
+  backs off the encoder, system self-corrects. ~25 lines, doesn't
+  conflict with the buffer-mode design.
+
 - **libx265 software encode for constrained links**. Has proper VBV
   rate control via `vbv-maxrate`/`vbv-bufsize`. CPU cost is real
   (~5-15ms/frame at 1080p on M1) but on a constrained link we're
