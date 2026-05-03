@@ -109,7 +109,7 @@ async def client_session(ws, cfg, bridge):
     # Shared between frame_sender (read/write) and input_reader (write).
     # Must be in outer scope so both closures reference the same variable.
     _need_keyframe = False
-    _last_lag_received = time.monotonic()  # proactive backoff when this goes stale
+    _last_lag_received = 0.0   # set on first lag report; 0 = never received (skip proactive backoff)
 
     def _upgrade_encoder(tw: int = 0, th: int = 0, explicit: bool = False):
         nonlocal encoder, has_webcodecs, _enc_target_w, _enc_target_h, _codec_error_msg
@@ -408,7 +408,7 @@ async def client_session(ws, cfg, bridge):
                 # as a 500ms lag signal so the server backs off before the queue grows further.
                 # Triggers only when we're actually sending (n_diag > 3 = at least 3 frames
                 # sent this DIAG cycle) and not already in a drain pause.
-                if not ctrl.draining and _n_diag > 3 and now - _last_lag_received > 0.5:
+                if not ctrl.draining and _n_diag > 3 and _last_lag_received > 0 and now - _last_lag_received > 0.5:
                     ctrl.on_lag(500.0, 0)
                     _last_lag_received = now  # reset so backoff debounce has time to fire
 

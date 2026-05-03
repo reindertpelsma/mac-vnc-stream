@@ -45,6 +45,7 @@ async def test_video():
             frames = 0
             keyframes = 0
             start = time.monotonic()
+            _last_lag_sent = 0.0
             while time.monotonic() - start < 8.0:
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
@@ -54,10 +55,18 @@ async def test_video():
                 if not isinstance(msg, (bytes, bytearray)) or len(msg) < 18:
                     continue
                 # Header: >IQBBI = seq(I) ts(Q) type(B) flags(B) codec(I)
-                _, _, ftype, _, _ = struct.unpack_from(">IQBBI", msg)
+                _, ts_ms, ftype, _, _ = struct.unpack_from(">IQBBI", msg)
                 frames += 1
                 if ftype == 1:  # keyframe
                     keyframes += 1
+                # Send lag reports so the server's feedback-gated ramp-up is exercised.
+                # Also prevents the proactive-backoff path from firing (which requires a
+                # real lag report to have been received before it arms itself).
+                now_ms = int(time.monotonic() * 1000)
+                if now_ms / 1000 - _last_lag_sent > 0.1:  # ~10/s, matching browser rate
+                    age_ms = now_ms - ts_ms
+                    await ws.send(json.dumps({"t": "lag", "age_ms": max(1, age_ms)}))
+                    _last_lag_sent = now_ms / 1000
 
             elapsed = time.monotonic() - start
             fps = frames / max(elapsed, 0.001)
