@@ -164,6 +164,20 @@ def main():
         log.info("SSH:    ssh -L %d:localhost:%d user@<host>", cfg.port, cfg.port)
         log.info("─" * 60)
 
+    # SIP status — informational only. With SIP disabled TCC enforcement is
+    # bypassed: SCK and CGEvent APIs work regardless of TCC.db contents, and
+    # TCCWatcher may never fire (DB doesn't change). The 30s retry loop and the
+    # direct API probes below handle this correctly without any special casing.
+    try:
+        import subprocess as _sp
+        _sip = _sp.run(["/usr/bin/csrutil", "status"],
+                       capture_output=True, text=True, timeout=3)
+        if "disabled" in _sip.stdout:
+            log.info("SIP disabled — TCC enforcement bypassed; "
+                     "probing APIs directly without consulting TCC.db")
+    except Exception:
+        pass
+
     _request_screen_capture_access()
     _request_accessibility()
     _start_compositor_keepalive()

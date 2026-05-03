@@ -94,13 +94,25 @@ step "Detecting environment"
 
 _VNC_REASON=""
 
-# Signal A: daemon already listening
+# Signal A: daemon already listening — port 5900 open means running and has TCC
 if nc -z 127.0.0.1 5900 2>/dev/null; then
     VNC_PRESEEDED=1
     _VNC_REASON="screensharingd running on port 5900"
 fi
 
-# Signal B: TCC.db has screensharingd approved (even if daemon is stopped)
+# Signal B: SIP disabled — TCC enforcement is bypassed, all screen capture APIs
+# work directly regardless of what TCC.db says. Reading TCC.db would give false
+# results here, so we skip it and trust the API will succeed.
+if [[ "$VNC_PRESEEDED" -eq 0 ]]; then
+    if /usr/bin/csrutil status 2>/dev/null | grep -q "disabled"; then
+        VNC_PRESEEDED=1
+        _VNC_REASON="SIP disabled — TCC bypassed, APIs work directly"
+    fi
+fi
+
+# Signal C: TCC.db has screensharingd approved but daemon is stopped.
+# Only reached when SIP is on (so TCC.db is authoritative) and port 5900 is
+# closed. In that case we can launchctl-load screensharingd and it will work.
 if [[ "$VNC_PRESEEDED" -eq 0 ]]; then
     _TCC_SIGNAL="$(python3 - <<'PYEOF' 2>/dev/null
 import sqlite3, os, sys
