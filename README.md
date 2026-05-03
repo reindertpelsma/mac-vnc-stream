@@ -34,6 +34,7 @@ This tool solves all of it by going below screensharingd:
 | Broken clipboard | pbpaste polling + native browser paste event; no permission required |
 | Broken key mapping | CGEvent keyboard injection with Mac virtual key codes; bypasses VNC keysym translation entirely |
 | Inverted/stuck modifiers | CGEvent tracks modifier state explicitly; no screensharingd state involved |
+| No audio | SCK captures system audio; streamed as Opus 128kbps over a separate WebSocket |
 
 ---
 
@@ -124,6 +125,7 @@ All flags can be set via CLI or environment variable:
 | **Paste to Mac** | **Ctrl+V** — works on all browsers, no clipboard permission needed |
 | **Copy from Mac** | Mac clipboard syncs to browser automatically (Chrome: live sync; Firefox/Safari: Ctrl+V fallback) |
 | Fullscreen | F11 or the fullscreen button |
+| **Audio** | **Click the Audio button — streams system audio via Opus 128kbps** |
 | Mobile | Touch events: tap, drag, pinch |
 
 ### Clipboard in detail
@@ -214,7 +216,6 @@ macOS 15+ restricts VNC type-2 connections to view-only. CGEvent input is unaffe
 
 ## Known limitations
 
-- **No audio.** VNC doesn't carry audio; SCK audio capture is not implemented.
 - **Screen must be unlocked.** Input events go to whatever is on screen, including the lock screen.
 - **Retina/HiDPI.** SCK captures at logical resolution (e.g. 1920×1080 on a 27" 5K display). Physical pixel counts above 4K will strain the encoder; use `--max-fps 30` on very high-res displays.
 - **HTTPS required for clipboard on LAN.** If you expose the server directly on a LAN (not via SSH tunnel), `navigator.clipboard.writeText` requires HTTPS. The SSH tunnel works around this by keeping everything on `localhost`.
