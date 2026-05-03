@@ -77,6 +77,24 @@ jobs:
           #                            high-entropy content, not a system test.)
           python3 tests/test_2mbps.py 6081 citest 20 1.0
 
+      - name: Run 2Mbps saturation test (high-bandwidth realistic content)
+        run: |
+          # Replaces the bouncing-balls animator with the "saturation" mode
+          # (250 small gradient-shaded blobs — many independent motions, smooth
+          # shading; looks like flowing video texture). Stays compressible
+          # but pushes encoded output past 1.7Mbps so the controller is
+          # forced to find equilibrium AGAINST the 2Mbps cap, not under it.
+          # The fps-stays-at-20 contract is the real responsiveness proof.
+          kill "$(cat /tmp/animate_pid)" 2>/dev/null || true
+          sleep 1
+          STRESS_MODE=saturation nohup python3 tests/ci_animate.py \
+            > /tmp/animate_sat.log 2>&1 &
+          echo $! > /tmp/animate_pid
+          sleep 3
+          # tail link >= 1.5Mbps  (controller saturated against 2Mbps cap;
+          #                        leaves 0.5Mbps margin for runner variance)
+          python3 tests/test_2mbps.py 6081 citest 20 1.5
+
       - name: Stop screen activity
         if: always()
         run: |

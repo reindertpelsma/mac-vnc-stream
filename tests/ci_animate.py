@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""Borderless fullscreen bouncing-balls animation to stress the H.264 encoder.
+"""Borderless fullscreen stress animation for the smoke/2Mbps tests.
 
-Run as a background subprocess before the smoke/2Mbps tests. Fills the
-entire main display with a hue-cycling background and bouncing colored
-circles so SCK captures motion across the WHOLE captured frame, not
-just a small windowed region. This is what gives the encoder enough
-visual residual to actually load a 2Mbps link (a small windowed
-animation only changes ~5% of the screen → tiny P-frames → ~0.5Mbps,
-which the controller serves trivially without ever ramping up).
+Two modes (selected via STRESS_MODE env var):
 
-Stress is the contract: even with the screen visually saturated, the
-end-to-end pipeline must still deliver 20fps and the controller must
-find equilibrium near the link cap (≥1.7Mbps of the 2Mbps budget).
-If GitHub's runner can't hold 20fps under this animation, that's a
-real signal about the system's responsiveness budget — not a reason
-to weaken the test.
+  default ("balls") — fullscreen with 50 hue-drifting bouncing circles.
+    Realistic-content stress for the stability test. H.264 compresses
+    this to ~1.2Mbps regardless of bandwidth budget (good codec,
+    predictable motion).
+
+  "saturation" — same shape, but 250 small fast-moving circles. Stays
+    visually realistic and compressible (it's still ball motion, not
+    pixel noise), but each ball moves independently so H.264 can't
+    use one global motion vector — every ball produces its own
+    residual. Pushes encoded output past 1.7Mbps so the controller
+    actually saturates against the 2Mbps cap instead of coasting
+    under it. Used by the saturation test.
 """
-import sys, random
+import os, sys, random
 
 try:
     import AppKit
     from Quartz import (
-        CALayer, CATransaction,
+        CALayer, CAGradientLayer, CATransaction,
         CGRectMake, CGColorGetColorSpace,
+        CGPointMake,
     )
 except ImportError:
     import time
@@ -31,10 +32,26 @@ except ImportError:
 
 random.seed(42)   # reproducible layout across runs
 
-NUM_BALLS    = 50    # tuned to push raw encoded bytes past 2Mbps so the
-                     # controller is forced into the saturation region; the
-                     # 2Mbps test then proves encoder compresses harder rather
-                     # than dropping frames (fps stays at 20).
+MODE = os.environ.get("STRESS_MODE", "balls")
+
+if MODE == "saturation":
+    # Many small gradient-shaded blobs — looks like flowing video texture
+    # (smooth shading, lots of small independent motions), compresses
+    # naturally but has too much novel residual per frame to fit under
+    # the codec's "easy" floor. Pushes encoded output >1.7Mbps.
+    NUM_BALLS  = 250
+    BALL_R_MIN = 12
+    BALL_R_MAX = 28
+    BALL_V_MIN = 14
+    BALL_V_MAX = 32
+else:
+    # Realistic stability content: 50 large hue-drifting circles. Compresses
+    # to ~1.2Mbps; tests controller stability under everyday motion.
+    NUM_BALLS  = 50
+    BALL_R_MIN = 30
+    BALL_R_MAX = 80
+    BALL_V_MIN = 8
+    BALL_V_MAX = 18
 TICK_HZ      = 60
 
 app = AppKit.NSApplication.sharedApplication()
@@ -66,20 +83,30 @@ def _nscolor(h, s=0.9, b=0.95, a=1.0):
 # Bouncing ball state + a CALayer per ball.
 # Sizes/velocities scaled so the balls traverse a meaningful fraction of
 # whatever the runner's display happens to be (don't hardcode 900×650).
+# In saturation mode each ball is a CAGradientLayer (smooth shading) —
+# more video-like to the encoder than flat colors and produces meaningful
+# per-ball residuals when dozens of them move independently.
 _scale = min(WIN_W, WIN_H) / 650.0
 balls = []
 for _ in range(NUM_BALLS):
-    r  = random.uniform(30, 80) * _scale
+    r  = random.uniform(BALL_R_MIN, BALL_R_MAX) * _scale
     bx = random.uniform(r, WIN_W - r)
     by = random.uniform(r, WIN_H - r)
-    vx = random.choice([-1, 1]) * random.uniform(8, 18) * _scale
-    vy = random.choice([-1, 1]) * random.uniform(8, 18) * _scale
+    vx = random.choice([-1, 1]) * random.uniform(BALL_V_MIN, BALL_V_MAX) * _scale
+    vy = random.choice([-1, 1]) * random.uniform(BALL_V_MIN, BALL_V_MAX) * _scale
     h  = random.uniform(0.0, 1.0)
 
-    layer = CALayer.layer()
+    if MODE == "saturation":
+        layer = CAGradientLayer.layer()
+        layer.setStartPoint_(CGPointMake(0.2, 0.2))
+        layer.setEndPoint_(CGPointMake(0.8, 0.8))
+        layer.setColors_([_nscolor(h, s=0.9, b=1.0).CGColor(),
+                          _nscolor((h + 0.15) % 1.0, s=0.6, b=0.4).CGColor()])
+    else:
+        layer = CALayer.layer()
+        layer.setBackgroundColor_(_nscolor(h).CGColor())
     layer.setFrame_(CGRectMake(bx - r, by - r, r * 2, r * 2))
     layer.setCornerRadius_(r)
-    layer.setBackgroundColor_(_nscolor(h).CGColor())
     root.addSublayer_(layer)
 
     balls.append({"layer": layer, "x": bx, "y": by, "r": r,
@@ -111,7 +138,12 @@ class _Ticker(AppKit.NSObject):
             b["h"] = (b["h"] + b["hv"]) % 1.0
             r = b["r"]
             b["layer"].setFrame_(CGRectMake(b["x"] - r, b["y"] - r, r * 2, r * 2))
-            b["layer"].setBackgroundColor_(_nscolor(b["h"]).CGColor())
+            if MODE == "saturation":
+                h = b["h"]
+                b["layer"].setColors_([_nscolor(h, s=0.9, b=1.0).CGColor(),
+                                       _nscolor((h + 0.15) % 1.0, s=0.6, b=0.4).CGColor()])
+            else:
+                b["layer"].setBackgroundColor_(_nscolor(b["h"]).CGColor())
         CATransaction.commit()
 
 
