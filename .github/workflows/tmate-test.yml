@@ -78,6 +78,13 @@ jobs:
           echo "=== Server log (first 40 lines) ==="
           head -40 /tmp/macvncstream.log || true
 
+          echo ""
+          echo "=== Local token check ==="
+          curl -si "http://localhost:6081/?token=citest" | head -5
+          echo ""
+          echo "=== Server process args ==="
+          ps aux | grep server.py | grep -v grep
+
       # ── Reverse SSH tunnel to relay host ──────────────────────────────────
       # The runner SSHes to our relay machine (51.159.237.61) using a
       # restricted keypair. The tunfwd user can only do port forwarding —
