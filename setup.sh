@@ -774,27 +774,36 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
     yellow "  │    • restarts the bundle in pure --api-only (SCK + CGEvent)"
     yellow "  └────────────────────────────────────────────────────────────────────┘"
     echo
-    read -rp "  Press Enter when permissions are granted (or Ctrl+C to leave in bootstrap mode): " _
-
-    # Verify the user actually granted before doing the production transition.
-    # Probe via the bundle's --tcc-check (which exits 0 only when both
-    # CGPreflightScreenCaptureAccess AND AXIsProcessTrusted return True for
-    # this exact bundle id + current CDHash). If they pressed Enter without
-    # granting, leave the bundle in bootstrap mode rather than silently
-    # dropping into a broken production state.
-    sleep 2  # give tccd a moment to commit the toggle
-    if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
-        :  # both granted — proceed with transition
-    else
+    # Loop until grants are actually applied OR the user Ctrl+C's out.
+    # Probe via the bundle's --tcc-check (exit 0 = both grants valid for
+    # com.macvncstream.server with current CDHash, exit 1 = something
+    # missing). Pressing Enter without granting just gives them another
+    # chance — no destructive transition unless TCC actually verifies.
+    while true; do
+        read -rp "  Press Enter when permissions are granted (Ctrl+C to leave in bootstrap mode): " _
+        sleep 2  # give tccd a moment to commit the toggle
+        if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
+            green "  Both grants confirmed — switching to production mode."
+            break
+        fi
+        # Try to give the user actionable detail about which grant is missing
+        # by reading --tcc-check's stdout (it prints screen_recording=0/1 +
+        # accessibility=0/1 lines).
+        _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
+        _missing=""
+        if echo "$_tcc_out" | grep -q "screen_recording=0"; then _missing+=" Screen Recording"; fi
+        if echo "$_tcc_out" | grep -q "accessibility=0";    then _missing+=" Accessibility"; fi
         echo
-        red    "  Permissions are NOT granted yet — staying in bootstrap mode."
-        red    "  TCC reports either Screen Recording or Accessibility (or both)"
-        red    "  is still off for 'mac-vnc-stream'. Re-run setup.sh after toggling"
-        red    "  both grants in System Settings ▸ Privacy & Security."
-        red    "  Bundle is still running with VNC fallback so you can keep using it."
+        yellow "  Not granted yet — still missing:${_missing:-' (TCC error — see log)'}"
+        yellow "  Open System Settings ▸ Privacy & Security and toggle the missing"
+        yellow "  panes ON for 'mac-vnc-stream'. If the entry isn't in the list,"
+        yellow "  click '+', press Cmd+Shift+G, paste:"
+        yellow "    ${APP_BUILT}"
+        yellow "  Then come back here and press Enter again. Or Ctrl+C to leave"
+        yellow "  the bundle running in bootstrap (VNC) mode and finish later."
         echo
-        exit 1
-    fi
+        unset _tcc_out _missing
+    done
 
     step "Switching to production mode"
     write_plist 0   # production: no --enable-vnc-fallback, no MACOS_PASS env
