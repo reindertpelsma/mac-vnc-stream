@@ -375,6 +375,67 @@ if [[ -z "$MVS_PASSWORD" ]]; then
     green "  Generated web token: $MVS_PASSWORD"
 fi
 
+# ── Authoritative TCC probe via TCC.db sudo query ────────────────────────────
+# The bundle's --tcc-check probe has multiple known failure modes:
+#   • PyObjC block-signature error on Tahoe ("Argument 4 is a block, but no
+#     signature available") — fixed by importing pyobjc-framework-ScreenCaptureKit
+#     properly, but only takes effect after rebuild
+#   • parent-shell inheritance lying on hosts where the launching shell has
+#     Screen Recording grant (GH macos-latest pre-grants /bin/bash)
+#   • CGPreflight returning True optimistically on some macOS versions
+#
+# When we have MACOS_PASS, query TCC.db directly via sudo+sqlite3. That's the
+# kernel's actual source of truth; not subject to any of the runtime quirks
+# above. Returns:
+#   echo "granted" | exit 0  — both rows have auth_value=2
+#   echo "missing" | exit 1  — at least one row missing or auth_value!=2
+#   echo "unknown" | exit 2  — no MACOS_PASS available (can't sudo)
+tcc_probe() {
+    if [[ -z "${MACOS_PASS:-}" ]]; then
+        echo "unknown"
+        return 2
+    fi
+    local _q="SELECT service, auth_value FROM access WHERE client='com.macvncstream.server' AND auth_value=2"
+    local _sr=0 _ax=0
+    # Query BOTH the system TCC.db and the per-user TCC.db. Apple's split
+    # between the two has shifted across releases — Screen Recording is
+    # typically system-wide on Sonoma+, but checking both costs nothing
+    # and reduces false-negative risk if Apple moves it again or if the
+    # user is on an older / quirky macOS. Take the max across the two.
+    local _out_sys _out_user
+    _out_sys="$(echo "$MACOS_PASS" | sudo -S sqlite3 \
+        "/Library/Application Support/com.apple.TCC/TCC.db" \
+        "$_q" 2>/dev/null || true)"
+    _out_user="$(sqlite3 \
+        "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+        "$_q" 2>/dev/null || true)"
+    while IFS='|' read -r _svc _val; do
+        [[ "$_svc" == "kTCCServiceScreenCapture" && "$_val" == "2" ]] && _sr=1
+        [[ "$_svc" == "kTCCServiceAccessibility" && "$_val" == "2" ]] && _ax=1
+    done <<< "$_out_sys"
+    while IFS='|' read -r _svc _val; do
+        [[ "$_svc" == "kTCCServiceScreenCapture" && "$_val" == "2" ]] && _sr=1
+        [[ "$_svc" == "kTCCServiceAccessibility" && "$_val" == "2" ]] && _ax=1
+    done <<< "$_out_user"
+    if [[ "$_sr" -eq 1 && "$_ax" -eq 1 ]]; then
+        echo "granted"
+        return 0
+    fi
+    # MDM-pre-granted bundles aren't in either TCC.db — they live in
+    # /var/db/ConfigurationProfiles. We do NOT query that here because:
+    # (1) MDM detection is best handled by the existing 'sudo profiles show'
+    #     check elsewhere in this script, and
+    # (2) a false-negative here only causes setup.sh to trigger VNC
+    #     bootstrap when it wasn't strictly needed — annoying but
+    #     recoverable; far safer than the false-positive that would result
+    #     from the bundle's broken --tcc-check probe (where the user gets
+    #     trapped in production mode without working grants).
+    # Bias toward "assume not granted unless clearly granted" — that's the
+    # conservative direction.
+    echo "missing sr=$_sr ax=$_ax"
+    return 1
+}
+
 # ── Step 5: Bundle decision ───────────────────────────────────────────────────
 # Done BEFORE the VNC decision because the bundle's TCC state determines
 # whether VNC bootstrap is even needed. Keep + valid grants → trivial happy
@@ -421,30 +482,45 @@ if [[ -d "$APP_DEST" ]]; then
                 yellow "  --no-tcc-probe → skipping probe, treating grants as missing"
                 ;;
             *)
-                # Probe via the bundle's --tcc-check:
-                #   exit 0 + screen_recording=1 + accessibility=1 → grants valid
-                #   exit 1 + screen_recording=0/1 + accessibility=0/1 → stale/missing
-                #   exit 2+ OR no 'screen_recording=' marker → bundle predates
-                #     the --tcc-check flag (built before commit 702d4ca). Can't
-                #     verify; trust the user's "keep" decision and skip the
-                #     reset+bootstrap dance — otherwise we'd nuke working grants.
-                _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
-                if echo "$_tcc_out" | grep -qE "screen_recording="; then
-                    if echo "$_tcc_out" | grep -q "screen_recording=1" \
-                            && echo "$_tcc_out" | grep -q "accessibility=1"; then
-                        TCC_GRANTED=1
-                        green "  Existing bundle has valid TCC grants — straight to production mode"
-                    else
-                        yellow "  Existing bundle is missing or has stale TCC grants"
-                        NEEDS_TCC_RESET=1   # stale-CDHash-on-keep → reset before re-grant
-                    fi
+                # Probe order:
+                #   1. tcc_probe (sudo+sqlite3 TCC.db) — authoritative when
+                #      MACOS_PASS available. Not subject to PyObjC quirks,
+                #      parent-shell inheritance, or CGPreflight optimism.
+                #   2. bundle's --tcc-check — fallback when no MACOS_PASS.
+                #      Less reliable (Tahoe block-signature bug, GH-runner
+                #      bash-inheritance lying), but better than nothing.
+                #   3. Bundle predates --tcc-check entirely (no marker line):
+                #      assume grants valid (user picked keep, trust them).
+                _probe_state="$(tcc_probe)"
+                _probe_rc=$?
+                if [[ "$_probe_rc" -eq 0 ]]; then
+                    TCC_GRANTED=1
+                    green "  Existing bundle has valid TCC grants (TCC.db sudo probe) — straight to production"
+                elif [[ "$_probe_rc" -eq 1 ]]; then
+                    yellow "  TCC.db says grants missing/stale — will re-grant via bootstrap"
+                    NEEDS_TCC_RESET=1
                 else
-                    yellow "  Existing bundle predates --tcc-check (built before that flag was added)."
-                    yellow "  Cannot verify TCC state via probe; assuming grants are valid as-is."
-                    yellow "  If the server doesn't work, re-run setup.sh and choose [r]ebuild."
-                    TCC_GRANTED=1   # optimistic — user chose keep, trust them
+                    # _probe_rc == 2 — no MACOS_PASS, fall back to --tcc-check
+                    _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
+                    if echo "$_tcc_out" | grep -qE "screen_recording="; then
+                        if echo "$_tcc_out" | grep -q "screen_recording=1" \
+                                && echo "$_tcc_out" | grep -q "accessibility=1"; then
+                            TCC_GRANTED=1
+                            green "  Existing bundle has valid TCC grants (bundle --tcc-check) — straight to production"
+                        else
+                            yellow "  Bundle --tcc-check reports grants missing or stale"
+                            NEEDS_TCC_RESET=1
+                        fi
+                    else
+                        yellow "  Bundle predates --tcc-check (or probe failed on this OS version)."
+                        yellow "  Cannot verify TCC state via probe; assuming grants are valid as-is."
+                        yellow "  If the server doesn't work, re-run with --macos-pass for an"
+                        yellow "  authoritative TCC.db query, or pick [r]ebuild."
+                        TCC_GRANTED=1   # optimistic — user chose keep, trust them
+                    fi
+                    unset _tcc_out
                 fi
-                unset _tcc_out
+                unset _probe_state _probe_rc
                 ;;
         esac
     fi
@@ -649,17 +725,24 @@ EOF
 # server invocation so the bundle maintains a VNC connection.
 NEEDS_VNC_FOR_GRANT=0
 NEEDS_VNC_AS_DISPLAY_WARMER=0
-# Gate on DISPLAY_ATTACHED rather than RUNNING_FROM_SSH. The SSH-flag was
-# being misled by tmate/tmux which strip SSH_CONNECTION from the inner
-# shell, so a real remote session could end up RUNNING_FROM_SSH=0 and skip
-# VNC bootstrap entirely — leaving the user with a frozen black screen.
-# DISPLAY_ATTACHED=0 alone is the meaningful "user can't see the screen"
-# signal: no physical display means VNC is the only way the user reaches
-# the desktop, regardless of how they got there (SSH, tmate, screen sharing
-# from another Mac, etc).
-if [[ "$TCC_GRANTED" -eq 0 && "$DISPLAY_ATTACHED" -eq 0 ]]; then
+# NEEDS_VNC_FOR_GRANT — fires when the user can't see the desktop locally
+# AND grants are not yet valid:
+#   • RUNNING_FROM_SSH=1 (user is remote — even a Mac with a display dongle
+#     attached has its grants in a Settings UI the SSH user can't reach
+#     directly; needs the bundle's VNC bridge to provide a browser view)
+#   • OR DISPLAY_ATTACHED=0 (no display at all — user is necessarily remote)
+# Either signal means the user needs the in-bundle VNC bridge as the path
+# to System Settings. Earlier this gated on DISPLAY_ATTACHED alone, which
+# silently skipped VNC for remote SSH users on Macs with a real display
+# attached (Scaleway with HDMI dongle pattern).
+if [[ "$TCC_GRANTED" -eq 0 ]] \
+   && { [[ "$RUNNING_FROM_SSH" -eq 1 ]] || [[ "$DISPLAY_ATTACHED" -eq 0 ]]; }; then
     NEEDS_VNC_FOR_GRANT=1
 fi
+# NEEDS_VNC_AS_DISPLAY_WARMER — only matters when SCK has no real display
+# backend. A physical display (or HDMI dongle) gives SCK its own backend;
+# headless cloud Macs without a dongle need the VNC connection to keep
+# screensharingd's virtual display rendered.
 if [[ "$DISPLAY_ATTACHED" -eq 0 ]]; then
     NEEDS_VNC_AS_DISPLAY_WARMER=1
 fi
@@ -974,35 +1057,91 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     # otherwise loop forever. Treat "no marker line in stdout" as "old
     # bundle, can't verify" and assume granted (user pressed Enter; trust
     # them).
+    # Verification is precise — never trust user Enter alone. Three-stage
+    # probe (any positive result is checked against runtime SCK afterward):
+    #   1. tcc_probe: sudo+sqlite3 query of system & user TCC.db. Authoritative
+    #      for whether the user actually toggled both services to auth_value=2.
+    #      Bypasses every runtime quirk (PyObjC block-signature on Tahoe,
+    #      parent-shell inheritance, CGPreflight optimism).
+    #   2. Bundle's --tcc-check: only used if tcc_probe returns "unknown"
+    #      (no MACOS_PASS available for sudo). Less reliable but still useful.
+    #   3. If neither probe can confirm grants, REFUSE to transition. Print
+    #      diagnostics and loop. Earlier this fell through to "trust user
+    #      Enter" which left users trapped in production mode without grants.
     while true; do
         read -rp "  Press Enter when permissions are granted (Ctrl+C to leave in bootstrap mode): " _
         sleep 2  # give tccd a moment to commit the toggle
-        _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
-        if ! echo "$_tcc_out" | grep -qE "screen_recording="; then
-            yellow "  --tcc-check unsupported by this bundle — accepting your Enter as confirmation."
-            green "  Switching to production mode."
-            TCC_GRANTED=1   # trust user
-            break
-        fi
-        if echo "$_tcc_out" | grep -q "screen_recording=1" \
-                && echo "$_tcc_out" | grep -q "accessibility=1"; then
-            green "  Both grants confirmed — switching to production mode."
-            TCC_GRANTED=1
-            break
-        fi
-        _missing=""
-        if echo "$_tcc_out" | grep -q "screen_recording=0"; then _missing+=" Screen Recording"; fi
-        if echo "$_tcc_out" | grep -q "accessibility=0";    then _missing+=" Accessibility"; fi
-        echo
-        yellow "  Not granted yet — still missing:${_missing:-' (probe parse error)'}"
-        yellow "  Open System Settings ▸ Privacy & Security and toggle the missing"
-        yellow "  panes ON for 'mac-vnc-stream'. If the entry isn't in the list,"
-        yellow "  click '+', press Cmd+Shift+G, paste:"
-        yellow "    ${APP_BUILT}"
-        yellow "  Then come back here and press Enter again. Or Ctrl+C to leave"
-        yellow "  the bundle running in bootstrap (VNC) mode and finish later."
-        echo
-        unset _tcc_out _missing
+        _probe_state="$(tcc_probe)"
+        _probe_rc=$?
+        case "$_probe_rc" in
+            0)
+                green "  Both grants confirmed via TCC.db (sudo) — switching to production mode."
+                TCC_GRANTED=1
+                break
+                ;;
+            1)
+                echo
+                yellow "  Not granted yet — TCC.db reports: ${_probe_state}"
+                yellow "  Open System Settings ▸ Privacy & Security and toggle BOTH:"
+                yellow "    • Screen Recording → 'mac-vnc-stream' ON"
+                yellow "    • Accessibility    → 'mac-vnc-stream' ON"
+                yellow "  IMPORTANT: Tahoe sometimes shows the toggle going ON then"
+                yellow "  silently reverts it to OFF if you skip the password prompt."
+                yellow "  Make sure Tahoe asks for your password and you actually enter it."
+                yellow "  Then Cmd+Q the Settings app — Tahoe occasionally only commits"
+                yellow "  the auth_value=2 row when Settings quits."
+                yellow "  If 'mac-vnc-stream' isn't in the pane, click '+', Cmd+Shift+G:"
+                yellow "    ${APP_BUILT}"
+                yellow "  Then come back here and press Enter again. Or Ctrl+C to leave"
+                yellow "  the bundle running in bootstrap (VNC) mode and finish later."
+                echo
+                ;;
+            2)
+                # No MACOS_PASS — fall back to bundle --tcc-check. If that also
+                # can't give a clear answer, REFUSE to transition. Earlier this
+                # branch fell through to "trust user Enter", which is what
+                # caused users to land in production mode without grants on
+                # Tahoe (where the bundle's --tcc-check is broken).
+                _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
+                if echo "$_tcc_out" | grep -q "screen_recording=1" \
+                        && echo "$_tcc_out" | grep -q "accessibility=1"; then
+                    green "  Both grants confirmed via bundle --tcc-check — switching to production mode."
+                    TCC_GRANTED=1
+                    break
+                fi
+                if echo "$_tcc_out" | grep -qE "screen_recording=0|accessibility=0"; then
+                    _missing=""
+                    if echo "$_tcc_out" | grep -q "screen_recording=0"; then _missing+=" Screen Recording"; fi
+                    if echo "$_tcc_out" | grep -q "accessibility=0";    then _missing+=" Accessibility"; fi
+                    echo
+                    yellow "  Not granted yet — bundle probe says still missing:${_missing}"
+                    yellow "  See instructions above. Re-toggle in Settings + Cmd+Q + Enter again."
+                    echo
+                else
+                    # Bundle probe failed to produce a marker (Tahoe PyObjC
+                    # block-signature error, etc). REFUSE to transition;
+                    # surface the failure and how to fix it.
+                    echo
+                    red "  Cannot verify grants — both probes failed:"
+                    red "    • TCC.db sudo probe: no MACOS_PASS available"
+                    red "    • bundle --tcc-check: produced no parseable result"
+                    echo "      bundle output: $(echo "$_tcc_out" | head -3)"
+                    echo
+                    yellow "  Two ways forward:"
+                    yellow "  (a) Press Ctrl+C to leave the bundle running in bootstrap mode."
+                    yellow "      Bundle is at /Applications/mac-vnc-stream.app and serves VNC."
+                    yellow "      Once you grant in System Settings, the running server's"
+                    yellow "      30s auto-upgrade loop picks SCK up automatically — no need"
+                    yellow "      for setup.sh to verify the transition."
+                    yellow "  (b) Re-run setup.sh with --macos-pass=<your-password> so this"
+                    yellow "      script can sudo-query TCC.db directly. That's authoritative."
+                    yellow "  Pressing Enter again WILL NOT transition — refusing without verification."
+                    echo
+                fi
+                unset _tcc_out _missing
+                ;;
+        esac
+        unset _probe_state _probe_rc
     done
 
     step "Switching to production mode"

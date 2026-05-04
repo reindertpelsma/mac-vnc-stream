@@ -96,21 +96,22 @@ def parse_args():
             ax.AXIsProcessTrusted.restype = _ct.c_bool
 
             # Screen Recording: probe via SCShareableContent — the SAME kernel
-            # TCC path that SCK uses at runtime. We previously tried
-            # CGPreflightScreenCaptureAccess and CGWindowListCreateImage; both
-            # walk the responsible-app chain, so on GH macos-latest runners
-            # they return True (because /bin/bash itself has Screen Recording
-            # auth_value=2 in TCC.db) even though our bundle's row has
-            # auth_value=0 (denied). SCK's kernel check ignores parent
-            # inheritance and looks ONLY at our bundle's row → -3801. The
-            # only probe whose result matches runtime SCK is SCShareableContent.
-            import objc as _objc
+            # TCC path that SCK uses at runtime. CGPreflightScreenCaptureAccess
+            # and CGWindowListCreateImage walk the responsible-app chain (on GH
+            # macos-latest runners /bin/bash is pre-granted, so those return
+            # True via inheritance even though our bundle's row is auth_value=0
+            # → kernel SCStream still fails -3801). SCShareableContent uses the
+            # strict path that ignores parent inheritance.
+            #
+            # Tahoe note: importing via objc.loadBundle does NOT register the
+            # completion-handler block signature, so the call fails with
+            # "Argument 4 is a block, but no signature available". The
+            # pyobjc-framework-ScreenCaptureKit Python module includes the
+            # auto-generated bridging metadata (block signatures included),
+            # so we import that way instead. py2app bundles this framework
+            # already (see setup.sh dependencies).
             from Foundation import NSRunLoop, NSDate, NSDefaultRunLoopMode
-            SCK = _objc.loadBundle(
-                "ScreenCaptureKit",
-                globals(),
-                bundle_path=_objc.pathForFramework(
-                    "/System/Library/Frameworks/ScreenCaptureKit.framework"))
+            from ScreenCaptureKit import SCShareableContent  # noqa: F401
 
             _ev = _th.Event()
             _err = [None]
