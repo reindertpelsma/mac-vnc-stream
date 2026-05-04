@@ -776,6 +776,26 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
     echo
     read -rp "  Press Enter when permissions are granted (or Ctrl+C to leave in bootstrap mode): " _
 
+    # Verify the user actually granted before doing the production transition.
+    # Probe via the bundle's --tcc-check (which exits 0 only when both
+    # CGPreflightScreenCaptureAccess AND AXIsProcessTrusted return True for
+    # this exact bundle id + current CDHash). If they pressed Enter without
+    # granting, leave the bundle in bootstrap mode rather than silently
+    # dropping into a broken production state.
+    sleep 2  # give tccd a moment to commit the toggle
+    if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
+        :  # both granted — proceed with transition
+    else
+        echo
+        red    "  Permissions are NOT granted yet — staying in bootstrap mode."
+        red    "  TCC reports either Screen Recording or Accessibility (or both)"
+        red    "  is still off for 'mac-vnc-stream'. Re-run setup.sh after toggling"
+        red    "  both grants in System Settings ▸ Privacy & Security."
+        red    "  Bundle is still running with VNC fallback so you can keep using it."
+        echo
+        exit 1
+    fi
+
     step "Switching to production mode"
     write_plist 0   # production: no --enable-vnc-fallback, no MACOS_PASS env
     green "  Plist rewritten — credentials removed"
@@ -802,20 +822,14 @@ fi
 step "Connection info"
 MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
 
-# Detect if SCK + AX are already granted.
+# Detect if SCK + AX are granted FOR THIS BUNDLE. Use the bundle's own
+# --tcc-check exclusively — running CGPreflight via the host's python3 here
+# would check setup.sh's identity (bash) which doesn't match com.macvncstream.server,
+# so the result would always be False even when the bundle's grants ARE valid.
 TCC_OK=0
 if [[ "$SIP_DISABLED" -eq 1 ]]; then
     TCC_OK=1
 elif [[ -n "$APP_BUILT" ]] && "$APP_BUILT/Contents/MacOS/mac-vnc-stream" --tcc-check 2>/dev/null; then
-    TCC_OK=1
-elif "$PYTHON_BINARY" -c '
-import ctypes, sys
-cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-ax = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
-ax.AXIsProcessTrusted.restype = ctypes.c_bool
-sys.exit(0 if (cg.CGPreflightScreenCaptureAccess() and ax.AXIsProcessTrusted()) else 1)
-' 2>/dev/null; then
     TCC_OK=1
 fi
 
