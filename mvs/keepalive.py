@@ -79,7 +79,8 @@ def _trigger_sck_tcc_registration():
     try:
         import subprocess as _sp, sys as _sys
         _sp.Popen(["launchctl", "asuser", str(uid),
-                   _sys.executable, "-c", _SCK_TCC_REG_SCRIPT])
+                   _sys.executable, "-c", _SCK_TCC_REG_SCRIPT],
+                  cwd=os.path.dirname(_sys.executable) or None)
         log.info("TCC: triggered Screen Recording registration via launchctl asuser %d", uid)
     except Exception as e:
         log.debug("asuser SCK TCC reg: %s", e)
@@ -224,9 +225,17 @@ def _start_compositor_keepalive():
     Falls back silently if the display or tkinter is unavailable (headless, SSH-only)."""
     try:
         import subprocess, threading, time as _time
+        # Inside a py2app .app bundle, sys.executable is .app/Contents/MacOS/python
+        # whose dyld dependencies use @executable_path-relative references to
+        # the embedded Python3.framework. When spawned with no cwd, dyld may
+        # resolve those against the parent's cwd instead of the binary's own
+        # location and fail with 'Library not loaded: @executable_path/...'.
+        # Pinning cwd to the binary's own directory keeps the relative paths
+        # consistent. No effect outside a bundle.
         proc = subprocess.Popen(
             [sys.executable, "-c", _COMPOSITOR_KEEPALIVE_SCRIPT],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=os.path.dirname(sys.executable) or None,
         )
         log.info("compositor keepalive started (PID %d)", proc.pid)
         def _watch():
@@ -507,7 +516,9 @@ except Exception as e:
     sys.exit(2)
 """
     try:
-        p = subprocess.run([sys.executable, "-c", _probe], timeout=12, capture_output=True)
+        p = subprocess.run([sys.executable, "-c", _probe], timeout=12,
+                           capture_output=True,
+                           cwd=os.path.dirname(sys.executable) or None)
         if p.returncode == 0:
             log.info("Screen Recording: SCK permission granted — window capture active")
             return True
