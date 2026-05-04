@@ -567,6 +567,35 @@ if [[ "$TCC_ALREADY_OK" -eq 0 && "$WANTS_VNC" -eq 1 ]]; then
     BOOTSTRAP_MODE=1
 fi
 
+# Detect "headless mac mini with no physical display attached AND no VNC".
+# SCK requires at least one renderable display; on a headless Mac the only
+# way to get one is an attached HDMI/Thunderbolt display, a "headless dongle"
+# (a fake HDMI plug that reports a connected display), or an active VNC
+# session via screensharingd. Without any of these, even fully-granted SCK
+# returns stale frames or "no displays" errors. Detect this state and warn
+# the user before they hit it as a frozen browser.
+DISPLAY_ATTACHED=0
+if command -v system_profiler >/dev/null 2>&1; then
+    # Resolution: appears once per attached display in system_profiler output.
+    if system_profiler SPDisplaysDataType 2>/dev/null | grep -q "Resolution:"; then
+        DISPLAY_ATTACHED=1
+    fi
+fi
+if [[ "$SIP_DISABLED" -eq 0 && "$DISPLAY_ATTACHED" -eq 0 && "$WANTS_VNC" -eq 0 ]]; then
+    echo
+    yellow "  ⚠  No physical display detected AND no VNC bootstrap configured."
+    yellow "     SCK requires at least one renderable display — without a"
+    yellow "     monitor / HDMI dongle / VNC session, the server will start"
+    yellow "     but frames will be stale (frozen browser)."
+    yellow "     Options:"
+    yellow "       • Attach a 'headless display dongle' (~\$10 fake-HDMI plug),"
+    yellow "       • Or re-run setup.sh and provide the macOS password to"
+    yellow "         enable VNC fallback (which keeps the virtual display alive),"
+    yellow "       • Or skip if you've already done one of the above and just"
+    yellow "         haven't told this script."
+    echo
+fi
+
 # Apply the TCC reset (fires on rebuild OR on stale-grant detection).
 # Doing it here, AFTER the keep/rebuild decision but BEFORE the plist
 # write + bootstrap, means the bundle's first launch in bootstrap mode
@@ -811,9 +840,32 @@ else
     if [[ "$WANTS_VNC" -eq 1 ]]; then
         green "  VNC bootstrap is active — you can already see the desktop in your"
         green "  browser. Use it to grant the permissions above."
+    elif [[ "$DISPLAY_ATTACHED" -eq 1 ]]; then
+        # Personal Mac with physical screen — user grants at the keyboard.
+        yellow "  Personal Mac path: grant the permissions on the Mac itself"
+        yellow "  (we detected an attached display). The browser will be black"
+        yellow "  until both grants are toggled on."
     else
-        yellow "  No VNC bootstrap was set up. The browser will show a 'permissions"
-        yellow "  needed' message until you grant Screen Recording at the keyboard."
+        # Headless cloud Mac without VNC and without a display: the browser
+        # WILL show a permissions-needed page (server.py serves that when
+        # SCK has no displays), but SCK ultimately can't activate without
+        # either a dongle or VNC. Tell the user the way out is to re-run
+        # setup.sh and provide the macOS password (which enables VNC
+        # bootstrap, which keeps the virtual display alive).
+        red    "  ┌─ NO DISPLAY + NO VNC = SERVER WILL STAY FROZEN ────────────────┐"
+        yellow "  │  The bundle is installed and the LaunchAgent is running, but   │"
+        yellow "  │  there's no way to capture frames: no physical display is      │"
+        yellow "  │  attached, and you didn't enable VNC bootstrap (no MACOS_PASS  │"
+        yellow "  │  was provided). Pick one to recover:                            │"
+        yellow "  │                                                                  │"
+        yellow "  │  1. Attach a 'headless display dongle' (~\$10) and re-run setup. │"
+        yellow "  │  2. Re-run setup.sh and provide your macOS password — the VNC  │"
+        yellow "  │     fallback will keep the virtual display alive while you     │"
+        yellow "  │     grant permissions, then drop to pure SCK production.       │"
+        yellow "  │  3. Manually enable Screen Sharing on the Mac (System Settings │"
+        yellow "  │     ▸ Sharing) and re-run setup.sh — that re-detects 5900 and  │"
+        yellow "  │     prompts for the password.                                   │"
+        red    "  └──────────────────────────────────────────────────────────────────┘"
     fi
 fi
 
