@@ -163,11 +163,24 @@ fi
 
 echo "  User: $MACOS_USER"
 
-# TCC pre-check: if Python already has both Screen Recording AND Accessibility,
-# skip VNC bootstrap entirely. No password prompt, no daemon, no MACOS_PASS in
-# any plist — install LaunchAgent in --api-only and we're done.
+# Pre-check 1: SIP status. With SIP disabled, TCC enforcement is bypassed —
+# SCK and CGEvent work regardless of TCC.db state. This is the GitHub macOS
+# runner case (and any custom-imaged Mac with SIP off). Skip the entire VNC
+# bootstrap and go straight to --api-only.
+SIP_DISABLED=0
 TCC_BOTH_GRANTED=0
-if command -v python3 >/dev/null 2>&1; then
+if csrutil status 2>&1 | grep -qi "disabled"; then
+    SIP_DISABLED=1
+    TCC_BOTH_GRANTED=1
+    green "  SIP disabled — TCC enforcement bypassed."
+    green "  Skipping VNC bootstrap → installing LaunchAgent in --api-only mode."
+fi
+
+# Pre-check 2: Python TCC grants. If both Screen Recording and Accessibility
+# are already granted to Python (CGPreflightScreenCaptureAccess +
+# AXIsProcessTrusted), skip VNC bootstrap entirely. No password prompt, no
+# daemon, no MACOS_PASS in any plist.
+if [[ "$TCC_BOTH_GRANTED" -eq 0 ]] && command -v python3 >/dev/null 2>&1; then
     if python3 - <<'PYEOF' 2>/dev/null
 import ctypes, sys
 try:
@@ -236,6 +249,39 @@ else
             green "  Password provided and verified"
         fi
     fi
+fi
+
+# Pre-check 3 (best-effort, requires sudo): MDM-managed TCC profile detection.
+# If the host has a com.apple.TCC.configuration-profile-policy payload installed
+# via MDM, user grants in System Settings may be silently overridden — Python
+# (or any non-whitelisted binary) can be Allow'd in the Settings pane, but
+# tccd's actual policy comes from the profile. This is exactly what Scaleway's
+# default Mac mini image ships with (verified 2026-05-04 on M2 Tahoe). Detect
+# it now and surface the escape hatch later in the post-install banner so the
+# user knows why their grants might not stick.
+MDM_TCC_PROFILE_ID=""
+if [[ -n "${MACOS_PASS:-}" ]]; then
+    _mdm_dump=$(echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null || true)
+    if echo "$_mdm_dump" | grep -q "com.apple.TCC.configuration-profile-policy"; then
+        # Extract the parent profileIdentifier of the TCC payload. awk pattern:
+        # remember the last profileIdentifier seen, print it on the matching
+        # payload-type line.
+        MDM_TCC_PROFILE_ID=$(echo "$_mdm_dump" | awk '
+            /profileIdentifier:/ { id=$NF }
+            /com.apple.TCC.configuration-profile-policy/ { print id; exit }')
+    fi
+    unset _mdm_dump
+fi
+if [[ -n "$MDM_TCC_PROFILE_ID" ]]; then
+    echo
+    yellow "  MDM TCC policy detected: $MDM_TCC_PROFILE_ID"
+    yellow "  This MDM may override your Privacy grants for non-whitelisted binaries"
+    yellow "  (Python interpreter is rarely whitelisted). If you grant Screen"
+    yellow "  Recording to Python and the upgrade still doesn't happen, the MDM is"
+    yellow "  the cause. Reversible escape hatch (re-installable by your provider):"
+    yellow "    sudo profiles remove -p $MDM_TCC_PROFILE_ID"
+    yellow "  Then re-run setup.sh. (The proper long-term fix is a signed .app"
+    yellow "  bundle with our own bundle identity — tracked separately.)"
 fi
 
 # ── Step 2: Find the best Python binary ───────────────────────────────────────
