@@ -20,16 +20,18 @@ permissions:
 
 jobs:
   build:
-    strategy:
-      matrix:
-        include:
-          - runner: macos-latest    # Apple Silicon (arm64)
-            arch: arm64
-          - runner: macos-13        # Intel (x86_64)
-            arch: x86_64
-      fail-fast: false              # one arch's failure shouldn't block the other
-    runs-on: ${{ matrix.runner }}
+    # Apple Silicon only. Intel was dropped because:
+    #   • macOS Tahoe (26.x) is arm64-only — we can't run our own bundle
+    #     on Intel macOS to verify any of it works
+    #   • Apple stopped selling Intel Macs in 2023
+    #   • macOS Sequoia (15.x) is the last Intel-supported release
+    #   • Shipping a binary we can't smoke-test is a maintenance burden
+    #     for an audience that's shrinking fast in 2026
+    # If demand reappears, re-add `macos-13` to a matrix block here.
+    runs-on: macos-latest
     timeout-minutes: 30
+    env:
+      ARCH: arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -37,9 +39,9 @@ jobs:
       - name: Confirm runner arch
         run: |
           echo "Runner uname -m: $(uname -m)"
-          echo "Expected: ${{ matrix.arch }}"
-          test "$(uname -m)" = "${{ matrix.arch }}" \
-            || { echo "Mismatch — runner arch != matrix arch"; exit 1; }
+          echo "Expected: ${{ env.ARCH }}"
+          test "$(uname -m)" = "${{ env.ARCH }}" \
+            || { echo "Mismatch — runner arch != expected"; exit 1; }
 
       - name: Install Python dependencies
         run: |
@@ -86,7 +88,7 @@ jobs:
       - name: Package
         id: package
         run: |
-          ARTIFACT="mac-vnc-stream-${{ matrix.arch }}.app.tar.gz"
+          ARTIFACT="mac-vnc-stream-${{ env.ARCH }}.app.tar.gz"
           # gzip-compressed tar so install.sh can pipe through tar -xzf.
           # -C dist/ + bare relative path keeps the archive's top-level
           # entry as `mac-vnc-stream.app/...` (extracts cleanly into
@@ -99,18 +101,18 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mac-vnc-stream-${{ matrix.arch }}
+          name: mac-vnc-stream-${{ env.ARCH }}
           path: |
-            mac-vnc-stream-${{ matrix.arch }}.app.tar.gz
-            mac-vnc-stream-${{ matrix.arch }}.app.tar.gz.sha256
+            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz
+            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz.sha256
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            mac-vnc-stream-${{ matrix.arch }}.app.tar.gz
-            mac-vnc-stream-${{ matrix.arch }}.app.tar.gz.sha256
+            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz
+            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
         env:

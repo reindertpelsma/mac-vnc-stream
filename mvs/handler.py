@@ -790,11 +790,14 @@ async def client_session(ws, cfg, bridge):
                 break
 
     global _active_clients
+    from . import caffeinate as _caf
     _active_clients += 1
+    _caf.acquire()
     try:
         await asyncio.gather(frame_sender(), input_reader(), dbg_sender(), ping_monitor())
     finally:
         _active_clients -= 1
+        _caf.release()
         _dbg_eval_sessions.discard(dbg_q)
     log.info("client disconnect: %s", ws.remote_address)
 
