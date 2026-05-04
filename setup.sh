@@ -966,8 +966,18 @@ if [[ "$NEEDS_VNC_FOR_GRANT" -eq 1 || "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; t
             fi
             if [[ -n "$MACOS_PASS" ]]; then
                 _attempts=0
+                # Use `dscl . -authonly` to validate the password against
+                # OpenDirectory directly. Previous implementation used
+                # `sudo -S -v` which hits sudo's 5-minute timestamp cache —
+                # if the user had already authenticated earlier in the
+                # session (likely, since setup.sh sudo's a few times for
+                # /Applications install + tccutil), `sudo -v` returns 0
+                # regardless of what password we pipe (the cached creds
+                # are still valid). User reported entering random chars
+                # and getting "verified" — this is the bug. dscl -authonly
+                # has no cache; returns 0 only when creds are actually right.
                 while true; do
-                    if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
+                    if dscl . -authonly "$MACOS_USER" "$MACOS_PASS" 2>/dev/null; then
                         VNC_FALLBACK=1
                         if [[ "$TCC_GRANTED" -eq 1 ]]; then
                             green "  macOS password verified for VNC display-warmer"
