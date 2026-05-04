@@ -403,6 +403,11 @@ class VNCBridge:
                 _keepalive_idx  = 0
                 _connect_ms     = _last_req_ms
                 _force_reconnect = False
+                # Content-stale watchdog cooldown — don't kickstart
+                # screensharingd more than once per 5 min, even if content
+                # stays static. Initialised so the first kick (if needed) is
+                # allowed immediately.
+                _last_content_kick_ms = 0
                 while True:
                     if _handler_mod._active_clients == 0:
                         time.sleep(0.2)  # no viewers — stop polling screensharingd to save CPU/battery
@@ -419,11 +424,42 @@ class VNCBridge:
                             log.info("VNC: periodic reconnect to prevent screensharingd input stall")
                             _force_reconnect = True
                             break
-                        # Watchdog: if screensharingd stopped sending FBUs for 30s,
-                        # treat it as a hard hang and restart if manage_screensharingd=True.
+                        # Watchdog #1: if screensharingd stopped sending FBUs
+                        # for 30s, treat it as a hard hang and restart if
+                        # manage_screensharingd=True.
                         if getattr(self._cfg, 'manage_screensharingd', False):
                             if now_ms - _last_fbu_ms > 30_000:
                                 log.warning("VNC: no FBU for 30s — screensharingd appears hung")
+                                self._restart_screensharingd()
+                                break  # reconnect outer loop will re-connect VNC
+
+                            # Watchdog #2: content-stale deadlock detection.
+                            # On cloud Macs without an active GUI session, the
+                            # virtual display can wedge into a state where
+                            # screensharingd keeps responding to FBU requests
+                            # with empty deltas (so watchdog #1 doesn't fire)
+                            # but the underlying display backend has actually
+                            # frozen — neither SCK nor VNC produces fresh
+                            # frames. The bundle's _vnc_keepwarm thread sends
+                            # pointer events every 25s which SHOULD register
+                            # as input + cause a cursor blink; if pixels still
+                            # haven't changed in 90s, the display is wedged
+                            # and a screensharingd kickstart unwedges it.
+                            # Verified live on Scaleway: bundle showed
+                            # vnc=0.0fps + fb_age=141s for 2.5 minutes; manual
+                            # `launchctl kickstart -k system/com.apple.screensharing`
+                            # restored fresh frames within 4s.
+                            #
+                            # 5-minute cooldown between content-kick attempts
+                            # prevents a kickstart loop on a genuinely idle
+                            # Mac where pixels just legitimately don't change.
+                            if now_ms - _last_change_ms > 90_000 \
+                               and now_ms - _last_content_kick_ms > 300_000:
+                                log.warning(
+                                    "VNC: pixels static for %ds despite keep-warm activity — "
+                                    "display backend likely wedged, kickstarting screensharingd",
+                                    (now_ms - _last_change_ms) // 1000)
+                                _last_content_kick_ms = now_ms
                                 self._restart_screensharingd()
                                 break  # reconnect outer loop will re-connect VNC
                         stale_ms = now_ms - _last_fbu_ms
