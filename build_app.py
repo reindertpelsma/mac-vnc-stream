@@ -125,9 +125,19 @@ def _post_build_sign():
     # --force overrides any existing signature, --deep signs nested binaries
     # (Python.framework dylibs, C extensions). - (single dash) is the ad-hoc
     # identity — no certificate needed.
+    # Notes on flags:
+    #   --force      — overwrite the existing Apple signatures inside the bundle
+    #   --deep       — recursively sign nested binaries (Python3.framework dylibs,
+    #                  C extensions inside site-packages)
+    #   --sign -     — ad-hoc identity (no certificate)
+    # NOT using --options runtime: hardened runtime forces strict library
+    # validation, which then rejects loading Apple's Python3 dylib because the
+    # ad-hoc-signed launcher has no Team ID while the framework was signed by
+    # Apple — they don't "match" under hardened-runtime rules. Hardened runtime
+    # only matters for notarization, which we don't do (we use xattr -dr quarantine
+    # instead). Without it, dyld is permissive enough to load mixed signatures.
     subprocess.check_call([
         'codesign', '--force', '--deep', '--sign', '-',
-        '--options', 'runtime',  # hardened runtime — required for some TCC paths on macOS 13+
         str(app_path),
     ])
     # Verify
