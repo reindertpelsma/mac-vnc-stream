@@ -167,14 +167,29 @@ if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
     # Cloud Mac: password needed for sudo (enable/restart screensharingd) and VNC auth.
     if [[ -z "$MACOS_PASS" ]]; then
         echo
-        yellow "  This Mac uses VNC capture (screensharingd is already running, or"
-        yellow "  Screen Recording cannot be granted interactively over SSH)."
-        yellow "  AppleDH authentication is required by macOS 15+ for full input"
-        yellow "  control, and it needs your login password every time the server"
-        yellow "  starts. The password will be stored in:"
-        yellow "    ~/Library/LaunchAgents/com.macvncstream.server.plist  (mode 0600)"
-        yellow "  Once Screen Recording is granted, switch to --api-only and remove"
-        yellow "  MACOS_PASS from the plist (see README ▸ Security)."
+        red    "  ┌─ HEADS UP ──────────────────────────────────────────────────────┐"
+        red    "  │                                                                  │"
+        yellow "  │  We're about to fall back to VNC (screensharingd) capture.       │"
+        yellow "  │                                                                  │"
+        yellow "  │  VNC is the BOOTSTRAP path, not the destination. Apple's         │"
+        yellow "  │  screensharingd implementation is laggy (3 s first-input         │"
+        yellow "  │  spikes are normal because it HID-idles after ~30 s of no        │"
+        yellow "  │  input), drops modifiers under load, and caps at ~21 fps. It     │"
+        yellow "  │  exists here ONLY so you can use the GUI long enough to grant    │"
+        yellow "  │  Screen Recording permission. Once you do that and re-run        │"
+        yellow "  │  setup.sh, the server upgrades to ScreenCaptureKit (SCK) +       │"
+        yellow "  │  CGEvent — 60 fps, ≤200 ms input latency, no modifier issues,    │"
+        yellow "  │  no stored password. That's the real product.                    │"
+        yellow "  │                                                                  │"
+        yellow "  │  Plan: open Safari to the URL setup prints, click Allow on the   │"
+        yellow "  │  Screen Recording prompt, re-run setup.sh, done.                 │"
+        yellow "  │                                                                  │"
+        red    "  └──────────────────────────────────────────────────────────────────┘"
+        echo
+        yellow "  AppleDH authentication is required by macOS 15+ for VNC input"
+        yellow "  control and needs your login password every time the server starts."
+        yellow "  The password will be stored in the LaunchAgent/Daemon plist"
+        yellow "  (mode 0600). It is removed automatically once you upgrade to SCK."
         echo
         read -rsp "  macOS login password: " MACOS_PASS
         echo
@@ -512,9 +527,23 @@ if [[ "$USE_DAEMON" -eq 0 ]]; then
 else
     if sudo_s launchctl bootstrap system "$PLIST_DEST"; then
         LOAD_DOMAIN="system"
-        yellow "  Loaded into system (LaunchDaemon — VNC capture/input only)"
-        yellow "  After you log in once via VNC and grant Screen Recording, re-run"
-        yellow "  setup.sh to upgrade to LaunchAgent (SCK/CGEvent path)."
+        echo
+        red    "  ┌─ YOU ARE IN BOOTSTRAP (VNC) MODE ───────────────────────────────┐"
+        yellow "  │  The service is now running, but capture is via screensharingd.  │"
+        yellow "  │  Expect: laggy mouse, ~21 fps, occasional modifier glitches,     │"
+        yellow "  │  3 s first-input spikes after idle. THIS IS NORMAL FOR VNC AND   │"
+        yellow "  │  IS NOT A BUG IN THIS SOFTWARE — it is what Apple's              │"
+        yellow "  │  screensharingd ships.                                           │"
+        yellow "  │                                                                  │"
+        yellow "  │  TO FIX IT (60 fps, no lag, no stored password):                 │"
+        yellow "  │    1. Open the Web UI in your browser (URL printed below).       │"
+        yellow "  │    2. A 'Python would like to record your screen' dialog should  │"
+        yellow "  │       appear in the VNC view. Click Allow Python.                │"
+        yellow "  │    3. SSH back in and re-run setup.sh.                           │"
+        yellow "  │    4. Setup auto-detects the new permissions and upgrades the    │"
+        yellow "  │       service to LaunchAgent + SCK + CGEvent. VNC is dropped.    │"
+        red    "  └──────────────────────────────────────────────────────────────────┘"
+        echo
     else
         die "launchctl bootstrap into system failed. See:
   sudo launchctl bootstrap system $PLIST_DEST"

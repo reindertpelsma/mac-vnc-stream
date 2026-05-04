@@ -122,6 +122,18 @@ If you close the dialogs by accident, open **System Settings → Privacy & Secur
 
 `setup.sh` installs all Python dependencies automatically.
 
+> **About VNC fallback (the bootstrap path).** On a fresh Mac that hasn't
+> granted Python the Screen Recording permission yet, the server cannot use
+> ScreenCaptureKit and falls back to Apple's `screensharingd` (VNC). VNC is
+> the **bootstrap** path, not the destination — Apple's `screensharingd`
+> implementation is laggy (3 s first-input spikes after idle, since it
+> HID-idles after ~30 s), drops modifiers under load, and caps at ~21 fps.
+> The whole point of the fallback is to let you click "Allow Python" on the
+> Screen Recording prompt that appears when the server starts. Once you do
+> that and re-run `setup.sh`, the server upgrades to SCK + CGEvent: 60 fps,
+> ≤200 ms input latency, no modifier issues, no stored password. **That is
+> the real product**; VNC is the on-ramp.
+
 ---
 
 ## Configuration
