@@ -305,14 +305,21 @@ else
     CODEC="jpeg"
 fi
 
-"$PYTHON_BINARY" -m pip install $_PIP_FLAGS \
+yellow "  Installing PyObjC frameworks (5 packages, can take 5–10 min on fresh Mac)..."
+# Drop --quiet for PyObjC: with old pip on fresh Macs the C-extension compile
+# can take many minutes per package, and silent mode looks like a hang. Keep
+# stderr visible so the user sees compile progress / wheel-building / errors.
+_PYOBJC_FLAGS="${_PIP_FLAGS//--quiet/}"
+if "$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS \
     pyobjc-core \
     pyobjc-framework-Cocoa \
     pyobjc-framework-Quartz \
     pyobjc-framework-AVFoundation \
-    pyobjc-framework-ScreenCaptureKit \
-    2>/dev/null && green "  PyObjC: installed" \
-               || yellow "  PyObjC partial install — SCK may be limited"
+    pyobjc-framework-ScreenCaptureKit; then
+    green "  PyObjC: installed"
+else
+    yellow "  PyObjC partial install — SCK may be limited"
+fi
 
 green "  Dependencies ready"
 
