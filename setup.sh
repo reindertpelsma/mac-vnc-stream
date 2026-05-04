@@ -499,27 +499,34 @@ NEEDS_TCC_RESET=0
 # (SCREENSHARINGD_PRESENT and DID_WE_CHECKED_SCREENSHARINGD declared in env-detection step.)
 
 if [[ -d "$APP_DEST" ]]; then
-    step "Existing bundle"
-    yellow "  Found: $APP_DEST"
-    yellow "  Keep preserves grants (CDHash unchanged); rebuild picks up source"
-    yellow "  changes but invalidates grants."
     if [[ -n "${MVS_PREBUILT_APP:-}" ]]; then
-        # install.sh just dropped a fresh pre-built .app and exec'd us.
-        # No source on disk to rebuild from anyway; auto-keep without
-        # prompting. The user explicitly chose the fast path by piping
-        # install.sh; we'd be undoing that choice if we asked them again.
-        green "  Pre-built bundle from install.sh — using as-is (no prompt)"
+        # install.sh's fast path: it already downloaded the latest release
+        # artifact AND replaced /Applications/mac-vnc-stream.app with it.
+        # The "keep / rebuild" prompt would be nonsensical here — there's
+        # no source code on disk to rebuild from, and the bundle in
+        # /Applications/ IS the just-downloaded latest. So we go straight
+        # to the LaunchAgent install. (For source-build updates: clone +
+        # setup.sh and pick [r]ebuild.)
+        step "Bundle from install.sh fast path"
+        green "  Using freshly-downloaded release bundle at $APP_DEST"
+        green "  (install.sh replaced any prior bundle with the latest release)"
         REBUILD_NEEDED=0
-    elif [[ "$HEADLESS" -eq 1 ]]; then
-        green "  Headless mode — keeping (default)"
-        REBUILD_NEEDED=0
-    elif [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
-        yellow "  --build-from-source given — forcing rebuild"
-        REBUILD_NEEDED=1
     else
-        read -rp "  [k]eep or [r]ebuild? [K/r] " _ans
-        [[ "$_ans" =~ ^[Rr]$ ]] && REBUILD_NEEDED=1
-        unset _ans
+        step "Existing bundle"
+        yellow "  Found: $APP_DEST"
+        yellow "  Keep preserves grants (CDHash unchanged); rebuild picks up source"
+        yellow "  changes but invalidates grants."
+        if [[ "$HEADLESS" -eq 1 ]]; then
+            green "  Headless mode — keeping (default)"
+            REBUILD_NEEDED=0
+        elif [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
+            yellow "  --build-from-source given — forcing rebuild"
+            REBUILD_NEEDED=1
+        else
+            read -rp "  [k]eep or [r]ebuild? [K/r] " _ans
+            [[ "$_ans" =~ ^[Rr]$ ]] && REBUILD_NEEDED=1
+            unset _ans
+        fi
     fi
     if [[ "$REBUILD_NEEDED" -eq 0 ]]; then
         APP_BUILT="$APP_DEST"
