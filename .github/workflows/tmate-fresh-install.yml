@@ -1,0 +1,87 @@
+name: tmate fresh-install test (no pre-setup)
+
+# Manual trigger only.
+#
+# Difference vs tmate-test.yml:
+#   • No pip install of Python deps
+#   • No server start
+#   • Just clones the repo and opens the reverse SSH tunnel + tmate
+#   • You drive `bash setup.sh` yourself over tmate, exercising the full
+#     fresh-Mac install path interactively.
+#
+# Use this for v1.0.0 release-bar testing: run setup.sh from scratch on a
+# clean macos-latest runner with only screensharingd + git available, and
+# verify the entire flow works without you running any other commands.
+on:
+  workflow_dispatch:
+
+jobs:
+  fresh-install:
+    runs-on: macos-latest
+    timeout-minutes: 60   # generous — first-time pip + py2app build is ~5–10 min
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Enable screensharingd so VNC bootstrap path is available ──────────
+      # GH macOS runners are real VMs with a GUI session, so screensharingd
+      # can be started with sudo. setup.sh detects port 5900 and offers the
+      # VNC bootstrap fallback (which is what cloud-Mac users will hit).
+      - name: Enable screensharingd
+        run: |
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sleep 2
+          nc -z 127.0.0.1 5900 && echo "screensharingd UP on :5900" || echo "screensharingd not listening"
+
+      # ── Reverse SSH tunnel: relay:16081 → runner:localhost:6081 ──────────
+      # Set up BEFORE tmate so the tunnel is alive when the user runs
+      # setup.sh. Once setup.sh starts the server on :6081, the user can
+      # access it via the relay at http://localhost:16081/?token=...
+      - name: Open reverse tunnel to relay
+        env:
+          TUNNEL_SSH_KEY: ${{ secrets.TUNNEL_SSH_KEY }}
+          TUNNEL_HOST: ${{ secrets.TUNNEL_HOST }}
+          TUNNEL_USER: ${{ secrets.TUNNEL_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$TUNNEL_SSH_KEY" > ~/.ssh/tunfwd_key
+          chmod 600 ~/.ssh/tunfwd_key
+          ssh-keyscan -H "$TUNNEL_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # GatewayPorts was already trust-allowed on the relay user.
+          # ExitOnForwardFailure=yes so we know immediately if the tunnel
+          # didn't come up. -R 16081:localhost:6081 forwards relay:16081
+          # to runner-side localhost:6081 (where setup.sh will eventually
+          # bind the server).
+          nohup ssh -i ~/.ssh/tunfwd_key \
+              -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=4 \
+              -o ExitOnForwardFailure=yes \
+              -R 16081:localhost:6081 \
+              -N \
+              "${TUNNEL_USER}@${TUNNEL_HOST}" > /tmp/tunnel.log 2>&1 &
+          echo $! > /tmp/tunnel.pid
+          sleep 4
+          if kill -0 "$(cat /tmp/tunnel.pid)" 2>/dev/null; then
+            echo "Tunnel alive. Relay: http://localhost:16081/?token=<token-from-setup.sh-output>"
+          else
+            echo "Tunnel died:"
+            cat /tmp/tunnel.log
+          fi
+
+      # ── tmate session — you drive setup.sh from inside ───────────────────
+      # When prompted by tmate, SSH into the runner. Then run:
+      #   cd $(pwd)/mac-vnc-stream  (or wherever GH actions put the checkout)
+      #   bash setup.sh
+      #
+      # setup.sh will print a token in the output. Use that token in the
+      # browser URL on the relay: http://localhost:16081/?token=<token>
+      # (your local machine SSH-tunnels to the relay separately so you
+      # can hit localhost:16081 — same chain as the tmate-test workflow.)
+      - name: tmate (SSH into this runner)
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 55
+        with:
+          limit-access-to-actor: true
