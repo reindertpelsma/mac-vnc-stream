@@ -361,36 +361,101 @@ if [[ "$SKIP_SCREEN_SHARING" -eq 0 ]]; then
     fi
 fi
 
-# ── Step 6: Install LaunchAgent ───────────────────────────────────────────────
-step "Installing LaunchAgent: $PLIST_PATH"
+# ── Step 6: Probe Aqua-session availability ───────────────────────────────────
+#
+# We need to decide between LaunchAgent (in gui/$UID — needs an actual Aqua
+# console session) and LaunchDaemon (in system, runs as $USER via UserName —
+# works headlessly). Probe by trying a no-op bootstrap of an empty plist into
+# gui/$UID. If that fails with code 125 ("Domain does not support specified
+# action") OR 134 ("Service cannot load in requested session"), we have only
+# an SSH session and must use the LaunchDaemon path.
+#
+# user/$UID exists for SSH sessions but launchd refuses to load LaunchAgents
+# into it on macOS 13+ (error 134). It's effectively a dead end — we go
+# straight from gui/$UID to LaunchDaemon.
+USE_DAEMON=0
+PROBE_PLIST="$(mktemp /tmp/mvs_probe_XXXXXX.plist)"
+cat > "$PROBE_PLIST" <<PROBE
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>Label</key><string>com.macvncstream.probe</string>
+    <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>
+    <key>RunAtLoad</key><false/>
+</dict></plist>
+PROBE
+launchctl bootout "gui/$(id -u)/com.macvncstream.probe" 2>/dev/null || true
+if ! launchctl bootstrap "gui/$(id -u)" "$PROBE_PLIST" 2>/dev/null; then
+    USE_DAEMON=1
+fi
+launchctl bootout "gui/$(id -u)/com.macvncstream.probe" 2>/dev/null || true
+rm -f "$PROBE_PLIST"
 
-mkdir -p "$HOME/Library/LaunchAgents"
+# ── Step 6b: Compose ProgramArguments ────────────────────────────────────────
+#
+# Daemon mode runs in system context — no window server connection, so SCK
+# init blocks indefinitely waiting for one. Force capture=vnc and input=vnc
+# so the server skips SCK/CGEvent entirely. Once permissions are granted and
+# the user has a console session, re-running setup.sh promotes to LaunchAgent
+# (gui/$UID) and drops these flags.
+EXTRA_ARGS=()
+if [[ "$USE_DAEMON" -eq 1 ]]; then
+    EXTRA_ARGS=(--capture vnc --input vnc)
+fi
 
-cat > "$PLIST_PATH" <<PLIST
+# ── Step 6c: Install LaunchAgent OR LaunchDaemon ──────────────────────────────
+if [[ "$USE_DAEMON" -eq 0 ]]; then
+    PLIST_DEST="$PLIST_PATH"   # ~/Library/LaunchAgents/...
+    step "Installing LaunchAgent: $PLIST_DEST"
+    mkdir -p "$HOME/Library/LaunchAgents"
+    USERNAME_BLOCK=""
+else
+    PLIST_DEST="/Library/LaunchDaemons/${LABEL}.plist"
+    step "Installing LaunchDaemon: $PLIST_DEST (no Aqua session detected)"
+    USERNAME_BLOCK="<key>UserName</key><string>${MACOS_USER}</string>
+    <key>GroupName</key><string>staff</string>
+    <key>WorkingDirectory</key><string>/Users/${MACOS_USER}</string>"
+fi
+
+# Build ProgramArguments XML from the array (handles --capture vnc --input vnc
+# extras for daemon mode).
+PROG_ARGS_XML="        <string>${PYTHON_BINARY}</string>
+        <string>${SERVER_PY}</string>
+        <string>--codec</string><string>${CODEC}</string>
+        <string>--max-fps</string><string>${MAX_FPS}</string>
+        <string>--listen</string><string>${LISTEN}</string>
+        <string>--port</string><string>${PORT}</string>"
+for a in "${EXTRA_ARGS[@]}"; do
+    PROG_ARGS_XML+="
+        <string>${a}</string>"
+done
+
+# Daemon mode runs as a different user, so we must export HOME/USER explicitly
+# or the server can't find anything (no shell to set them).
+HOME_USER_BLOCK=""
+if [[ "$USE_DAEMON" -eq 1 ]]; then
+    HOME_USER_BLOCK="        <key>HOME</key><string>/Users/${MACOS_USER}</string>
+        <key>USER</key><string>${MACOS_USER}</string>
+"
+fi
+
+PLIST_TMP="$(mktemp /tmp/mvs_plist_XXXXXX)"
+cat > "$PLIST_TMP" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
     <string>${LABEL}</string>
-
+    ${USERNAME_BLOCK}
     <key>ProgramArguments</key>
     <array>
-        <string>${PYTHON_BINARY}</string>
-        <string>${SERVER_PY}</string>
-        <string>--codec</string>
-        <string>${CODEC}</string>
-        <string>--max-fps</string>
-        <string>${MAX_FPS}</string>
-        <string>--listen</string>
-        <string>${LISTEN}</string>
-        <string>--port</string>
-        <string>${PORT}</string>
+${PROG_ARGS_XML}
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>MACOS_USER</key>
+${HOME_USER_BLOCK}        <key>MACOS_USER</key>
         <string>${MACOS_USER}</string>
         <key>MACOS_PASS</key>
         <string>${MACOS_PASS}</string>
@@ -411,43 +476,49 @@ cat > "$PLIST_PATH" <<PLIST
 </plist>
 PLIST
 
-green "  Plist written (mode 0600)"
-chmod 600 "$PLIST_PATH"
+if [[ "$USE_DAEMON" -eq 0 ]]; then
+    mv "$PLIST_TMP" "$PLIST_DEST"
+    chmod 600 "$PLIST_DEST"
+    green "  Plist written (mode 0600, user-owned)"
+else
+    sudo_s install -m 600 -o root -g wheel "$PLIST_TMP" "$PLIST_DEST"
+    rm -f "$PLIST_TMP"
+    green "  Plist written (mode 0600, root-owned, /Library/LaunchDaemons)"
+fi
+
 if [[ -n "$MACOS_PASS" ]]; then
     yellow "  Plist contains MACOS_PASS for VNC AppleDH auth (the only way macOS 15+"
     yellow "  permits full input control via VNC). To stop storing it: grant Screen"
-    yellow "  Recording, then edit the plist to drop MACOS_PASS and add --api-only."
-else
-    green "  Plist contains no credentials — runtime uses SCK only"
+    yellow "  Recording on a console login, then re-run setup.sh — it will switch"
+    yellow "  to LaunchAgent + --api-only and drop MACOS_PASS automatically."
 fi
 
-# ── Step 7: (Re)load the LaunchAgent ─────────────────────────────────────────
+# ── Step 7: (Re)load the service ─────────────────────────────────────────────
 step "Starting mac-vnc-stream service"
 
-# bootout + bootstrap ensures the plist is fully re-read (kickstart reuses
-# the cached program path and ignores plist changes).
-#
-# Domain choice: gui/$UID requires an active Aqua console session. On a
-# fresh-install cloud Mac with no console login (only SSH), gui/$UID does
-# not exist and bootstrap fails with "125: Domain does not support specified
-# action". user/$UID exists for any login session including SSH, and is
-# enough for VNC capture/input — the cloud-Mac case. Try gui first (gives
-# SCK access when available), fall back to user.
+# Clean up any prior load in either domain so this bootstrap reads the fresh plist.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-launchctl bootout "user/$(id -u)/$LABEL" 2>/dev/null || true
+sudo_s launchctl bootout "system/$LABEL" 2>/dev/null || true
 sleep 1
 LOAD_DOMAIN=""
-if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
-    LOAD_DOMAIN="gui/$(id -u)"
-    green "  Loaded into $LOAD_DOMAIN (full GUI session — SCK/CGEvent available)"
-elif launchctl bootstrap "user/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
-    LOAD_DOMAIN="user/$(id -u)"
-    yellow "  No Aqua session detected — loaded into $LOAD_DOMAIN (VNC capture only)"
-    yellow "  After you log in via VNC at least once, re-run setup.sh to switch to gui/\$UID"
-    yellow "  for SCK capture and CGEvent input."
+if [[ "$USE_DAEMON" -eq 0 ]]; then
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST_DEST"; then
+        LOAD_DOMAIN="gui/$(id -u)"
+        green "  Loaded into $LOAD_DOMAIN (Aqua session — SCK/CGEvent available)"
+    else
+        die "launchctl bootstrap into gui/$(id -u) failed unexpectedly. See:
+  launchctl bootstrap gui/$(id -u) $PLIST_DEST"
+    fi
 else
-    die "launchctl bootstrap failed in both gui/$(id -u) and user/$(id -u). Run with -d for details:
-  launchctl bootstrap user/$(id -u) $PLIST_PATH"
+    if sudo_s launchctl bootstrap system "$PLIST_DEST"; then
+        LOAD_DOMAIN="system"
+        yellow "  Loaded into system (LaunchDaemon — VNC capture/input only)"
+        yellow "  After you log in once via VNC and grant Screen Recording, re-run"
+        yellow "  setup.sh to upgrade to LaunchAgent (SCK/CGEvent path)."
+    else
+        die "launchctl bootstrap into system failed. See:
+  sudo launchctl bootstrap system $PLIST_DEST"
+    fi
 fi
 
 echo -n "  Waiting for server"
@@ -562,5 +633,9 @@ echo "  The server upgrades automatically within 5s after permissions are grante
 echo
 echo "  Python: $PYTHON_BINARY"
 echo "  Log:    tail -f $LOG_PATH"
-echo "  Restart: launchctl kickstart -k $LOAD_DOMAIN/$LABEL"
+if [[ "$USE_DAEMON" -eq 1 ]]; then
+    echo "  Restart: sudo launchctl kickstart -k $LOAD_DOMAIN/$LABEL"
+else
+    echo "  Restart: launchctl kickstart -k $LOAD_DOMAIN/$LABEL"
+fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

@@ -287,7 +287,8 @@ The token travels in the URL query string (`?token=…`). This is safe when acce
 
 ```bash
 launchctl bootout "gui/$(id -u)/com.macvncstream.server" 2>/dev/null || \
-  launchctl bootout "user/$(id -u)/com.macvncstream.server"
+  sudo launchctl bootout system/com.macvncstream.server
+sudo rm -f /Library/LaunchDaemons/com.macvncstream.server.plist
 rm ~/Library/LaunchAgents/com.macvncstream.server.plist
 rm -rf ~/mac-vnc-stream
 ```
