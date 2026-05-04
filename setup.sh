@@ -1200,105 +1200,52 @@ else
     pkill -9 -f "${REPO_DIR}/dist/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
     sleep 2
 
-    # Try the bootstrap. If it fails with "Domain does not support specified
-    # action" (rc=125), gui/$UID doesn't exist — happens on cloud Macs where
-    # the user has only SSH access, no prior physical / VNC login, no other
-    # LaunchAgent keeping gui/$UID alive.
+    # Try the bootstrap. If it fails with rc=125 / "Domain does not support
+    # specified action", gui/$UID doesn't exist — happens on Macs where
+    # nobody has logged in via the console (physical keyboard or Apple Screen
+    # Sharing.app). This is a hard macOS security boundary: gui/$UID requires
+    # the *console user* to BE the target user, which only happens through
+    # Apple's loginwindow flow. RFB Apple-DH auth (the "control an
+    # already-logged-in screen" path) doesn't promote to a console session.
     #
-    # Recovery: spawn the bundle's --vnc-prime as a BACKGROUND DAEMON. It
-    # authenticates against screensharingd (RFB Apple-DH) and stays
-    # connected — the persistent connection is what makes screensharingd
-    # actually materialize gui/$UID (a connect-and-disconnect probe was
-    # observed insufficient on Scaleway: vnc_prime_ok printed but gui/$UID
-    # still missing 2s later). Setup.sh polls launchctl for gui/$UID for up
-    # to 20 seconds, retries bootstrap once it appears, then kills the
-    # daemon (the bundle's own --enable-vnc-fallback bridge takes over
-    # keeping the session warm).
+    # We tried auto-priming via --vnc-prime (RFB auth). Verified live on
+    # Scaleway Tahoe: the auth succeeds but gui/$UID never materializes —
+    # screensharingd treats the connection as a remote-control session, not
+    # a login session. There's no programmatic way to drive Apple's
+    # loginwindow flow from outside their Screen Sharing client UI.
+    #
+    # Action: surface a clear, actionable error. First login on a
+    # never-logged-in Mac is a one-time manual step. After that, the
+    # bundle's --enable-vnc-fallback bridge keeps gui/$UID alive across
+    # reboots — subsequent install.sh / setup.sh runs Just Work.
     _bootstrap_out="$(launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1 || true)"
     if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
         LOAD_DOMAIN="gui/$(id -u)"
         green "  Loaded into ${LOAD_DOMAIN}"
     elif echo "$_bootstrap_out" | grep -qiE "Domain does not support|125:"; then
-        if [[ -n "$MACOS_PASS" ]] && [[ -x "$LAUNCHAGENT_BINARY" ]]; then
-            yellow "  gui/$(id -u) not present — priming via persistent VNC connection"
-            yellow "  to screensharingd (Apple DH auth)..."
-            # Pipe vnc-prime stdout to a temp file so we can detect the
-            # "vnc_prime_ok=" line without blocking on the daemon process.
-            _prime_log="$(mktemp /tmp/mvs-prime.XXXXXX.log)"
-            "$LAUNCHAGENT_BINARY" --vnc-prime \
-                --macos-user "$MACOS_USER" --macos-pass "$MACOS_PASS" \
-                > "$_prime_log" 2>&1 &
-            _prime_pid=$!
-            # Wait up to 10s for vnc_prime_ok to appear in the log
-            _prime_ok=0
-            for _i in $(seq 1 100); do
-                if grep -q "vnc_prime_ok" "$_prime_log" 2>/dev/null; then
-                    _prime_ok=1; break
-                fi
-                if grep -q "vnc_prime_error" "$_prime_log" 2>/dev/null; then
-                    break
-                fi
-                kill -0 "$_prime_pid" 2>/dev/null || break
-                sleep 0.1
-            done
-            if [[ "$_prime_ok" -ne 1 ]]; then
-                kill "$_prime_pid" 2>/dev/null || true
-                _prime_msg="$(cat "$_prime_log" 2>/dev/null | tail -3)"
-                rm -f "$_prime_log"
-                die "VNC-prime failed: ${_prime_msg}
-Cannot auto-create gui/$(id -u) without working VNC auth. Either:
-  • Log in via Apple Screen Sharing.app from another Mac to vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
-  • Or attach a display + login locally
-Then re-run setup.sh."
-            fi
-            green "  vnc_prime_ok — daemon holding session (pid $_prime_pid)"
-            # Poll for gui/$UID to materialize. screensharingd takes time to
-            # spawn AppleVNCServer + register the user session with launchd.
-            _gui_seen=0
-            for _i in $(seq 1 40); do  # 40 * 0.5s = 20s
-                if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
-                    _gui_seen=1; break
-                fi
-                sleep 0.5
-            done
-            if [[ "$_gui_seen" -eq 1 ]]; then
-                green "  gui/$(id -u) detected — retrying bootstrap"
-                if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
-                    LOAD_DOMAIN="gui/$(id -u)"
-                    green "  Loaded into ${LOAD_DOMAIN} (after VNC-prime)"
-                    # Bundle's own --enable-vnc-fallback bridge will keep the
-                    # session alive going forward; vnc-prime daemon is now
-                    # redundant. Kill it to free the connection slot.
-                    kill "$_prime_pid" 2>/dev/null || true
-                    rm -f "$_prime_log"
-                else
-                    kill "$_prime_pid" 2>/dev/null || true
-                    rm -f "$_prime_log"
-                    die "launchctl bootstrap retry failed even after gui/$(id -u) appeared.
-Inspect: launchctl print gui/$(id -u) | head"
-                fi
-            else
-                kill "$_prime_pid" 2>/dev/null || true
-                rm -f "$_prime_log"
-                die "gui/$(id -u) did not materialize within 20s despite VNC-prime auth.
-Possible causes:
-  • screensharingd's AppleVNCServer spawn was blocked
-    (check 'sudo launchctl print system/com.apple.screensharing | head')
-  • A loginwindow / SACL policy is blocking the session
-  • macOS version-specific behavior we haven't seen before
-
-Recover by logging in via Apple Screen Sharing.app from another Mac to
-  vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
-then re-run setup.sh."
-            fi
-            unset _prime_log _prime_pid _prime_ok _gui_seen _i _prime_msg
-        else
-            die "launchctl bootstrap into gui/$(id -u) failed (no Aqua session).
-No --macos-pass available to auto-prime via VNC handshake. Either:
-  • Re-run setup.sh with --macos-pass=<your-password> so we can prime VNC
-  • Or log in via Apple Screen Sharing once to vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
-    then re-run setup.sh"
-        fi
+        _mac_ip="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
+        red    "  ┌─ ONE-TIME LOGIN REQUIRED — macOS security boundary ──────────────┐"
+        yellow "  │  This Mac has no Aqua session yet (console user is 'root',         │"
+        yellow "  │  i.e. loginwindow is waiting for someone to log in). macOS         │"
+        yellow "  │  requires a real loginwindow authentication to create gui/${MACOS_USER}      │"
+        yellow "  │  — software-side VNC tricks can't bypass this (we tried).         │"
+        yellow "  │                                                                     │"
+        yellow "  │  ONE-TIME FIX from any other Mac on the network or your laptop:    │"
+        yellow "  │                                                                     │"
+        yellow "  │    1. Open Finder, press ⌘K (Connect to Server)                    │"
+        yellow "  │    2. Enter:  vnc://${_mac_ip}:5900                                │"
+        yellow "  │    3. Authenticate as user '${MACOS_USER}' with your macOS password           │"
+        yellow "  │    4. The Mac's desktop will appear. You don't need to do anything │"
+        yellow "  │       inside it — just having logged in is what creates gui/${MACOS_USER}.    │"
+        yellow "  │    5. Disconnect Screen Sharing, then come back here and run:      │"
+        yellow "  │         bash <(curl -fsSL https://raw.githubusercontent.com/${MACOS_USER}/${MACOS_USER}/main/install.sh)   │"
+        yellow "  │                                                                     │"
+        yellow "  │  After this one-time login, every future setup.sh run will boot    │"
+        yellow "  │  cleanly: the bundle's --enable-vnc-fallback bridge maintains      │"
+        yellow "  │  gui/${MACOS_USER} indefinitely (across reboots, kernel updates, etc).        │"
+        red    "  └─────────────────────────────────────────────────────────────────────┘"
+        unset _mac_ip
+        die "Bootstrap aborted — log in once via Screen Sharing.app then re-run."
     else
         die "launchctl bootstrap into gui/$(id -u) failed: $_bootstrap_out"
     fi
