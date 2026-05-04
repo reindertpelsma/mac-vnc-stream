@@ -119,10 +119,18 @@ if [[ "$FORCE_BUILD_FROM_SOURCE" -eq 0 ]]; then
 
             # Hand off to setup.sh in install-only mode (it'll detect the
             # existing $APP_DEST and just write+load the LaunchAgent without
-            # rebuilding). For now we still need the source for setup.sh
-            # itself, so curl it directly into a small temp dir.
+            # rebuilding). Fetch setup.sh at the SAME tag as the bundle
+            # artifact rather than `main`, for two reasons:
+            #   • tag content is immutable, so CDN caching is fine and
+            #     guaranteed-correct (vs `main` where raw.githubusercontent
+            #     serves a 5-min-stale cache and users hit "I just pushed
+            #     a fix but install.sh got the old setup.sh")
+            #   • setup.sh from the same tag is guaranteed in-sync with the
+            #     bundle artifact's expectations — no mismatch between
+            #     v0.1.0 bundle behaviors and v0.2.0 main setup.sh
             SETUP_TMP="$(mktemp -d /tmp/mvs-setup.XXXXXX)"
-            curl -fsSL "$REPO_URL/raw/main/setup.sh" -o "$SETUP_TMP/setup.sh"
+            curl -fsSL "$REPO_URL/raw/${RELEASE_TAG}/setup.sh" -o "$SETUP_TMP/setup.sh" \
+                || die "failed to fetch setup.sh from ${RELEASE_TAG}"
             chmod +x "$SETUP_TMP/setup.sh"
             export MVS_PREBUILT_APP="$APP_DEST"
             exec bash "$SETUP_TMP/setup.sh" "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
