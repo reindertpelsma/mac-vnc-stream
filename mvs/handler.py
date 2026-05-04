@@ -20,8 +20,36 @@ _dbg_eval_sessions: set = set()
 # live WebSocket sessions; capture loops idle when 0
 _active_clients: int = 0
 
-# Read the frontend HTML at module load time (from the split-out file).
-_FRONTEND_HTML = (Path(__file__).parent.parent / "frontend" / "index.html").read_bytes()
+# Read the frontend HTML at module load time. Path resolution must work in
+# both layouts:
+#   • dev / git clone:    repo/mvs/handler.py + repo/frontend/index.html
+#   • py2app .app bundle: .app/Contents/Resources/lib/.../mvs/handler.py +
+#                         .app/Contents/Resources/frontend/index.html
+def _load_frontend_html():
+    import sys as _sys
+    here = Path(__file__).resolve()
+    # 1. Dev layout: ../frontend/index.html relative to mvs/.
+    cand = here.parent.parent / "frontend" / "index.html"
+    if cand.is_file():
+        return cand.read_bytes()
+    # 2. py2app bundle: walk up looking for Contents/Resources/frontend/.
+    p = here
+    for _ in range(8):
+        if (p / "Contents" / "Resources" / "frontend" / "index.html").is_file():
+            return (p / "Contents" / "Resources" / "frontend" / "index.html").read_bytes()
+        if p.parent == p:
+            break
+        p = p.parent
+    # 3. Last-ditch: same dir as sys.executable (e.g. .app/Contents/MacOS/) →
+    #    sibling Resources/frontend/index.html.
+    exe_dir = Path(_sys.executable).resolve().parent
+    cand2 = exe_dir.parent / "Resources" / "frontend" / "index.html"
+    if cand2.is_file():
+        return cand2.read_bytes()
+    raise FileNotFoundError(
+        "frontend/index.html not found near %s or %s" % (here, exe_dir))
+
+_FRONTEND_HTML = _load_frontend_html()
 
 _LOGIN_HTML = b"""\
 <!DOCTYPE html>
