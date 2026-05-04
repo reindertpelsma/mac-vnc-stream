@@ -1,8 +1,33 @@
 import logging
+import os
 import sys
 import threading
 
 log = logging.getLogger("macvnc")
+
+
+def _os_geteuid_is_root():
+    try:
+        return os.geteuid() == 0
+    except Exception:
+        return False
+
+
+def _find_console_uid():
+    """Return the uid of the currently-logged-in console user, or None.
+    On a cloud Mac with VNC login, this is whichever uid screensharingd
+    let in. Falls back to scanning /dev/console ownership."""
+    try:
+        import subprocess
+        # `stat -f %u /dev/console` returns the owning uid of the console.
+        out = subprocess.run(["stat", "-f", "%u", "/dev/console"],
+                             capture_output=True, text=True, timeout=2)
+        uid = int(out.stdout.strip())
+        if uid >= 500:  # skip system uids
+            return uid
+    except Exception:
+        pass
+    return None
 
 _COMPOSITOR_KEEPALIVE_SCRIPT = """\
 # Keeps macOS's display compositor running at the display refresh rate.
@@ -147,12 +172,41 @@ def _request_screen_capture_access():
         except Exception:
             pass
         result = cg.CGRequestScreenCaptureAccess()
+        # When running in system context (LaunchDaemon), the call above won't
+        # register Python with TCC because the originating process isn't in a
+        # user/Aqua session. Result: the Screen Recording pane opens but Python
+        # isn't in the togglable list. Re-attempt the request via launchctl
+        # asuser, which routes the API call through the user's session — that
+        # registration *does* land. Best-effort; quietly skipped if not running
+        # as root (LaunchAgent path doesn't need this).
+        if not result and _os_geteuid_is_root():
+            try:
+                import subprocess as _sp, os as _os, sys as _sys
+                # Find a logged-in non-system uid to dispatch the API call into.
+                uid = _find_console_uid()
+                if uid is not None:
+                    _sp.Popen(["launchctl", "asuser", str(uid),
+                               _sys.executable, "-c",
+                               "import ctypes; cg=ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics');"
+                               "cg.CGRequestScreenCaptureAccess.restype=ctypes.c_bool;"
+                               "cg.CGRequestScreenCaptureAccess()"])
+            except Exception as _e:
+                log.debug("asuser SR registration: %s", _e)
         if not result:
+            import sys as _sys, os as _os
+            py = _sys.executable
             log.info(
-                "Screen Recording: permission not yet granted. "
-                "To enable 60fps SCK capture: open System Settings → Privacy & Security → "
-                "Screen Recording, enable Python (com.apple.python3), then the server will "
-                "automatically switch to 60fps within ~30 seconds."
+                "Screen Recording: permission not yet granted.\n"
+                "  To enable 60 fps SCK capture, open System Settings → Privacy & Security →\n"
+                "  Screen Recording. If 'Python' is already listed, toggle it ON.\n"
+                "  If Python is NOT listed (common when the server runs as a LaunchDaemon —\n"
+                "  the system context can't auto-register Python with TCC), click the '+'\n"
+                "  button at the bottom-left of the pane and navigate to the Python binary:\n"
+                "    %s\n"
+                "  Hint: in the file picker press Cmd+Shift+G and paste the path above.\n"
+                "  After granting, the server detects the change within ~30 s and switches\n"
+                "  to 60 fps. No restart needed.",
+                py,
             )
             # Belt-and-suspenders: open the Privacy → Screen Recording pane via
             # `open`. CGRequestScreenCaptureAccess()'s in-process dialog needs
