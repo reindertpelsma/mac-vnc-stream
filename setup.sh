@@ -331,14 +331,30 @@ elif [[ -d "$APP_DEST" ]]; then
     if [[ "$REBUILD_NEEDED" -eq 0 ]]; then
         APP_BUILT="$APP_DEST"
         LAUNCHAGENT_BINARY="$APP_DEST/Contents/MacOS/mac-vnc-stream"
-        # Probe TCC. --tcc-check exit 0 = both grants valid AND CDHash matches.
-        if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
-            TCC_GRANTED=1
-            green "  Existing bundle has valid TCC grants — straight to production mode"
+        # Probe TCC via the bundle's --tcc-check.
+        #   exit 0 + screen_recording=1 + accessibility=1 → grants valid
+        #   exit 1 + screen_recording=0/1 + accessibility=0/1 → stale/missing
+        #   exit 2+ OR no 'screen_recording=' marker → bundle predates the
+        #     --tcc-check flag (built before commit 702d4ca). Can't verify;
+        #     trust the user's "keep" decision and skip the reset+bootstrap
+        #     dance — otherwise we'd nuke their working grants.
+        _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
+        if echo "$_tcc_out" | grep -qE "screen_recording="; then
+            if echo "$_tcc_out" | grep -q "screen_recording=1" \
+                    && echo "$_tcc_out" | grep -q "accessibility=1"; then
+                TCC_GRANTED=1
+                green "  Existing bundle has valid TCC grants — straight to production mode"
+            else
+                yellow "  Existing bundle is missing or has stale TCC grants"
+                NEEDS_TCC_RESET=1   # stale-CDHash-on-keep → reset before re-grant
+            fi
         else
-            yellow "  Existing bundle is missing or has stale TCC grants"
-            NEEDS_TCC_RESET=1   # stale-CDHash-on-keep → reset before re-grant
+            yellow "  Existing bundle predates --tcc-check (built before that flag was added)."
+            yellow "  Cannot verify TCC state via probe; assuming grants are valid as-is."
+            yellow "  If the server doesn't work, re-run setup.sh and choose [r]ebuild."
+            TCC_GRANTED=1   # optimistic — user chose keep, trust them
         fi
+        unset _tcc_out
     fi
 else
     REBUILD_NEEDED=1   # no bundle yet — fresh install
@@ -670,26 +686,32 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
     yellow "  └────────────────────────────────────────────────────────────────────┘"
     echo
     # Loop until grants are actually applied OR the user Ctrl+C's out.
-    # Probe via the bundle's --tcc-check (exit 0 = both grants valid for
-    # com.macvncstream.server with current CDHash, exit 1 = something
-    # missing). Pressing Enter without granting just gives them another
-    # chance — no destructive transition unless TCC actually verifies.
+    # Probe via the bundle's --tcc-check, which prints
+    # 'screen_recording=0/1' and 'accessibility=0/1' lines. The lines are the
+    # primary signal — exit code alone is ambiguous because old bundles that
+    # predate --tcc-check exit 2 (argparse error) on the flag and could
+    # otherwise loop forever. Treat "no marker line in stdout" as "old
+    # bundle, can't verify" and assume granted (user pressed Enter; trust
+    # them).
     while true; do
         read -rp "  Press Enter when permissions are granted (Ctrl+C to leave in bootstrap mode): " _
         sleep 2  # give tccd a moment to commit the toggle
-        if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
+        _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
+        if ! echo "$_tcc_out" | grep -qE "screen_recording="; then
+            yellow "  --tcc-check unsupported by this bundle — accepting your Enter as confirmation."
+            green "  Switching to production mode."
+            break
+        fi
+        if echo "$_tcc_out" | grep -q "screen_recording=1" \
+                && echo "$_tcc_out" | grep -q "accessibility=1"; then
             green "  Both grants confirmed — switching to production mode."
             break
         fi
-        # Try to give the user actionable detail about which grant is missing
-        # by reading --tcc-check's stdout (it prints screen_recording=0/1 +
-        # accessibility=0/1 lines).
-        _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
         _missing=""
         if echo "$_tcc_out" | grep -q "screen_recording=0"; then _missing+=" Screen Recording"; fi
         if echo "$_tcc_out" | grep -q "accessibility=0";    then _missing+=" Accessibility"; fi
         echo
-        yellow "  Not granted yet — still missing:${_missing:-' (TCC error — see log)'}"
+        yellow "  Not granted yet — still missing:${_missing:-' (probe parse error)'}"
         yellow "  Open System Settings ▸ Privacy & Security and toggle the missing"
         yellow "  panes ON for 'mac-vnc-stream'. If the entry isn't in the list,"
         yellow "  click '+', press Cmd+Shift+G, paste:"
