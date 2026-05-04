@@ -133,6 +133,24 @@ if command -v system_profiler >/dev/null 2>&1 \
     DISPLAY_ATTACHED=1
 fi
 
+# screensharingd pre-decision. We only consider screensharingd at all when:
+#   (a) the host is potentially headless — running over SSH with no
+#       physical display attached. A physical display means SCK has its
+#       own backend; we never need to start screensharingd just for that.
+#   (b) screensharingd is actually installed on this Mac (its launchd
+#       plist exists). Cloud Macs that ship without it can't use this
+#       path regardless.
+# Independent of SIP state: SIP-off + headless still needs screensharingd
+# as the display warmer, and SIP-on + headless needs it both as
+# permission-grant viewer AND as display warmer.
+SCREENSHARINGD_PRESENT=0
+DID_WE_CHECKED_SCREENSHARINGD=0
+if [[ "$DISPLAY_ATTACHED" -eq 0 \
+        && "$RUNNING_FROM_SSH" -eq 1 \
+        && -f /System/Library/LaunchDaemons/com.apple.screensharing.plist ]]; then
+    SCREENSHARINGD_PRESENT=1
+fi
+
 # ── Step 2: Find the best Python ──────────────────────────────────────────────
 step "Finding Python 3.9+"
 
@@ -303,8 +321,7 @@ APP_DEST="/Applications/mac-vnc-stream.app"
 REBUILD_NEEDED=0
 TCC_GRANTED=0
 NEEDS_TCC_RESET=0
-DID_WE_CHECKED_SCREENSHARINGD=0
-SCREENSHARINGD_PRESENT=0
+# (SCREENSHARINGD_PRESENT and DID_WE_CHECKED_SCREENSHARINGD declared in env-detection step.)
 
 if [[ "$SIP_DISABLED" -eq 1 ]]; then
     # SIP off: TCC isn't enforcing. Run server.py directly, no bundle.
@@ -364,28 +381,31 @@ fi
 ensure_screensharingd() {
     # Returns 0 (true) if screensharingd is running on :5900, non-zero otherwise.
     # Memoized: subsequent calls return the cached result without re-prompting.
-    # If port 5900 is closed but screensharingd is configured (TCC-known), prompts
-    # the user to start it, with a one-line $1 reason.
+    # Early-return if the env-detection pre-check already decided we don't
+    # NEED screensharingd at all (physical display attached, or running
+    # locally, or screensharingd not even installed). The pre-check sets
+    # SCREENSHARINGD_PRESENT=0 in those cases — never start screensharingd
+    # on a Mac with its own physical display.
     local reason="${1:-keep the screen alive}"
+    if [[ "$SCREENSHARINGD_PRESENT" -eq 0 && "$DID_WE_CHECKED_SCREENSHARINGD" -eq 1 ]]; then
+        return 1  # already decided we don't need it
+    fi
     if [[ "$DID_WE_CHECKED_SCREENSHARINGD" -eq 1 ]]; then
-        return $((1 - SCREENSHARINGD_PRESENT))
+        return 0  # already decided yes
+    fi
+    if [[ "$SCREENSHARINGD_PRESENT" -eq 0 ]]; then
+        # Pre-check said we don't want screensharingd. Mark checked + bail.
+        DID_WE_CHECKED_SCREENSHARINGD=1
+        return 1
     fi
     DID_WE_CHECKED_SCREENSHARINGD=1
+    # Pre-check decided we DO want screensharingd. Now: is it actually up?
     if nc -z 127.0.0.1 5900 2>/dev/null; then
-        SCREENSHARINGD_PRESENT=1; return 0
+        return 0   # SCREENSHARINGD_PRESENT already 1 from pre-check
     fi
-    # Configured-but-stopped detection requires sudo to read TCC.db.
-    local ssd_known=0
-    if [[ -n "${MACOS_PASS:-}" ]] && \
-       echo "$MACOS_PASS" | sudo -S sqlite3 \
-           /Library/Application\ Support/com.apple.TCC/TCC.db \
-           "SELECT 1 FROM access WHERE client='com.apple.screensharing.agent' LIMIT 1" \
-           2>/dev/null | grep -q 1; then
-        ssd_known=1
-    fi
-    if [[ "$ssd_known" -eq 0 ]]; then
-        return 1   # not configured, can't start
-    fi
+    # Port 5900 closed. Screensharingd is installed on this Mac (pre-check
+    # checked /System/Library/LaunchDaemons/com.apple.screensharing.plist
+    # exists), so we can offer to start it.
     if [[ "$HEADLESS" -eq 1 ]]; then
         yellow "  screensharingd configured but stopped. Headless — skipping."
         yellow "  Start manually: sudo launchctl kickstart -k system/com.apple.screensharing"
@@ -418,15 +438,42 @@ ensure_screensharingd() {
     return 1
 }
 
-# ── Step 7: VNC fallback decision (only when needed) ─────────────────────────
-# VNC fallback is needed when ALL THREE are true:
-#   • SIP enabled (TCC is enforcing)
-#   • TCC not granted yet (so we need a way for the user to grant)
-#   • Running over SSH (no physical screen access)
-# Otherwise the user can just grant at the keyboard.
-VNC_FALLBACK=0
+# ── Step 7: VNC fallback decision ────────────────────────────────────────────
+# VNC plays TWO different roles, both of which can independently require it:
+#
+#   ROLE 1: Permission-grant viewer (only when TCC enforcement is active).
+#     SIP enabled + TCC not yet granted + SSH session → user needs to view
+#     the desktop in a browser so they can navigate System Settings and
+#     toggle the grants. Without this, headless cloud Macs are stuck.
+#
+#   ROLE 2: Display warmer (regardless of SIP state).
+#     macOS releases the virtual display backend when no client is
+#     attached. SCK then captures stale or zero frames even if it's
+#     fully permitted. On a host with NO physical display
+#     (DISPLAY_ATTACHED=0, common on cloud Mac minis without a HDMI
+#     dongle), our bundle's VNC connection IS what keeps the display
+#     rendered. This applies even on SIP-off systems — TCC bypassed
+#     doesn't help if there's no display to capture in the first place.
+#
+# Either role triggers VNC_FALLBACK=1, which means setup.sh will
+# (1) ensure screensharingd is running, (2) prompt for a password if
+# we don't already have one, (3) include --enable-vnc-fallback in the
+# server invocation so the bundle maintains a VNC connection.
+NEEDS_VNC_FOR_GRANT=0
+NEEDS_VNC_AS_DISPLAY_WARMER=0
 if [[ "$SIP_DISABLED" -eq 0 && "$TCC_GRANTED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
-    if ensure_screensharingd "to view the desktop while granting Screen Recording / Accessibility"; then
+    NEEDS_VNC_FOR_GRANT=1
+fi
+if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+    NEEDS_VNC_AS_DISPLAY_WARMER=1
+fi
+VNC_FALLBACK=0
+if [[ "$NEEDS_VNC_FOR_GRANT" -eq 1 || "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; then
+    _vnc_reason="to view the desktop while granting Screen Recording / Accessibility"
+    if [[ "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 && "$NEEDS_VNC_FOR_GRANT" -eq 0 ]]; then
+        _vnc_reason="to keep the virtual display alive (no physical display attached)"
+    fi
+    if ensure_screensharingd "$_vnc_reason"; then
         echo
         yellow "  Optional VNC bootstrap. Provides a live desktop view in your browser"
         yellow "  while you grant TCC permissions. Skip with empty password if you'll"
@@ -459,11 +506,22 @@ if [[ "$SIP_DISABLED" -eq 0 && "$TCC_GRANTED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1
                 done
                 unset _attempts
             else
-                green "  No password — skipping VNC (assumes physical screen access)"
+                if [[ "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; then
+                    yellow "  No password provided — but VNC is needed as a DISPLAY WARMER"
+                    yellow "  on this host (no physical display detected). Without it, SCK"
+                    yellow "  has no renderable display and the browser will be black."
+                    yellow "  Server will TRY to connect to screensharingd anyway (some"
+                    yellow "  VNC configs accept type-1 'no auth'); succeeds on GH runners,"
+                    yellow "  may fail elsewhere. Re-run with --macos-pass if it doesn't work."
+                    VNC_FALLBACK=1   # try anyway; bundle will negotiate auth or fail gracefully
+                else
+                    green "  No password — skipping VNC (assumes physical screen access)"
+                fi
             fi
         fi
     fi
 fi
+unset _vnc_reason
 
 # Optional MDM TCC profile detection (informational only — no auto-action).
 if [[ "$SIP_DISABLED" -eq 0 && -n "${MACOS_PASS:-}" ]]; then
@@ -530,7 +588,17 @@ fi
 
 # ── Step 7: write_plist function (called once or twice depending on mode) ─────
 write_plist() {
-    local include_vnc="$1"   # 1 = include --enable-vnc-fallback + MACOS_PASS env
+    # Two independent inputs:
+    #   $1 include_vnc_flag — pass --enable-vnc-fallback to the server. Set
+    #                         when VNC_FALLBACK=1 (either grant-bootstrap or
+    #                         permanent display-warmer for headless hosts).
+    #   $2 include_password — store MACOS_PASS in the plist env. Set ONLY
+    #                         during the transient bootstrap-grant window;
+    #                         dropped after the transition so the password
+    #                         doesn't survive in the plist on disk.
+    #   If $2 omitted, defaults to $1 (legacy single-arg call sites).
+    local include_vnc_flag="$1"
+    local include_password="${2:-$1}"
     local args=(
         "$LAUNCHAGENT_BINARY"
     )
@@ -542,7 +610,7 @@ write_plist() {
         --max-fps "$MAX_FPS"
         --codec "$CODEC"
     )
-    [[ "$include_vnc" -eq 1 ]] && args+=(--enable-vnc-fallback)
+    [[ "$include_vnc_flag" -eq 1 ]] && args+=(--enable-vnc-fallback)
 
     local prog_xml=""
     for a in "${args[@]}"; do prog_xml+="        <string>${a}</string>
@@ -551,7 +619,7 @@ write_plist() {
     local env_xml="        <key>MACOS_USER</key><string>${MACOS_USER}</string>
         <key>MVS_PASSWORD</key><string>${MVS_PASSWORD}</string>
 "
-    if [[ "$include_vnc" -eq 1 && -n "$MACOS_PASS" ]]; then
+    if [[ "$include_password" -eq 1 && -n "$MACOS_PASS" ]]; then
         env_xml+="        <key>MACOS_PASS</key><string>${MACOS_PASS}</string>
 "
     fi
@@ -584,7 +652,10 @@ PLIST
 
 # ── Step 8: Write the appropriate plist + (re)load ────────────────────────────
 step "Installing LaunchAgent: $PLIST_PATH"
-write_plist "$BOOTSTRAP_MODE"
+# Two args to write_plist: include_vnc_flag, include_password_env.
+# vnc_flag: VNC_FALLBACK (bootstrap OR permanent display-warmer needs it)
+# password: BOOTSTRAP_MODE only (transient — gone after grants)
+write_plist "$VNC_FALLBACK" "$BOOTSTRAP_MODE"
 if [[ "$BOOTSTRAP_MODE" -eq 1 ]]; then
     yellow "  Plist: BOOTSTRAP mode — temporarily includes --enable-vnc-fallback"
     yellow "  and MACOS_PASS env. Both are removed after you grant permissions."
@@ -723,7 +794,12 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
     done
 
     step "Switching to production mode"
-    write_plist 0   # production: no --enable-vnc-fallback, no MACOS_PASS env
+    # Post-grant production plist:
+    #  • include_vnc_flag: keep --enable-vnc-fallback if NEEDS_VNC_AS_DISPLAY_WARMER
+    #    (headless host still needs VNC connection to keep screensharingd's
+    #    virtual display rendered). Drop it on hosts with a physical display.
+    #  • include_password: 0 unconditionally (production never stores password).
+    write_plist "$NEEDS_VNC_AS_DISPLAY_WARMER" 0
     green "  Plist rewritten — credentials removed"
     # bootout + bootstrap (NOT kickstart -k). kickstart -k just SIGTERMs the
     # process; KeepAlive then restarts it with the CACHED service definition,
