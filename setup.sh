@@ -281,11 +281,20 @@ if [[ -n "$MDM_TCC_PROFILE_ID" ]]; then
     _enroll_id=$(echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null | \
         awk '/profileIdentifier:/{id=$NF} /com.apple.mdm$/{print id; exit}')
     echo
-    yellow "  MDM TCC policy detected (profile: $MDM_TCC_PROFILE_ID)."
-    yellow "  This MDM overrides Privacy grants for non-whitelisted binaries."
-    yellow "  Python interpreter is rarely whitelisted, so 'Allow Python' in"
-    yellow "  System Settings ▸ Screen Recording will silently NOT take effect"
-    yellow "  — the actual SCK call returns -3801 (TCC declined) regardless."
+    red    "  ┌─ MDM-MANAGED MAC: SCK UPGRADE WILL NOT WORK WITHOUT REMOVAL ────┐"
+    yellow "  │  An MDM profile manages TCC on this Mac (e.g. Scaleway,           │"
+    yellow "  │  MacStadium). It overrides Privacy grants for non-whitelisted     │"
+    yellow "  │  binaries. Python interpreter is rarely whitelisted, so           │"
+    yellow "  │  'Allow Python' in Settings ▸ Screen Recording will silently      │"
+    yellow "  │  NOT take effect — the SCK call returns -3801 (TCC declined)      │"
+    yellow "  │  regardless of what the toggle shows.                             │"
+    yellow "  │                                                                   │"
+    yellow "  │  CONSEQUENCE if you don't remove the MDM here: the server stays   │"
+    yellow "  │  permanently on VNC capture (laggy, ~21 fps, modifier glitches,   │"
+    yellow "  │  3 s first-input spikes). The auto-upgrade to SCK will never      │"
+    yellow "  │  fire — there is no in-OS workaround.                             │"
+    red    "  └───────────────────────────────────────────────────────────────────┘"
+    yellow "  Detected profile: $MDM_TCC_PROFILE_ID"
 
     if [[ -n "$_enroll_id" ]]; then
         echo
@@ -338,8 +347,15 @@ PYEOF
                 yellow "  profiles -R failed. Continuing with VNC bootstrap."
             fi
         else
-            yellow "  Skipped. Continuing with VNC bootstrap. To do this manually"
-            yellow "  later: sudo profiles -R -p $_enroll_id"
+            echo
+            red    "  Skipped MDM removal. The server WILL install successfully and"
+            red    "  WILL be reachable via the VNC capture path, but it will stay"
+            red    "  on VNC indefinitely — there is no auto-upgrade path on an"
+            red    "  MDM-managed Mac. To unblock SCK later, re-run setup.sh and"
+            red    "  answer 'y' at this prompt, or manually run:"
+            red    "    sudo profiles -R -p $_enroll_id"
+            red    "  then re-toggle Python in System Settings ▸ Screen Recording."
+            echo
         fi
     else
         yellow "  Could not auto-detect the enrollment profile. To remove manually:"
