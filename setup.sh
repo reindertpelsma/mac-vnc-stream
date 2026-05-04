@@ -175,6 +175,15 @@ green "    grants against this app, not the shared Python interpreter"
 RUNNING_FROM_SSH=0
 if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
     RUNNING_FROM_SSH=1
+elif [[ -n "${TMUX:-}${TMATE_VERSION:-}" ]]; then
+    # tmate/tmux sessions strip SSH_CONNECTION from the inner shell, but
+    # if we're inside one of them on macOS it's almost certainly a remote
+    # session (you don't run tmate locally for fun). Treat as remote.
+    RUNNING_FROM_SSH=1
+elif [[ "$(ps -o comm= -p "$PPID" 2>/dev/null || true)" == *"sshd"* ]]; then
+    # Final fallback: parent process is sshd. Catches edge cases where the
+    # shell was launched fresh inside an SSH session that scrubbed env.
+    RUNNING_FROM_SSH=1
 fi
 
 # Display detection — used for the no-display + no-VNC frozen-screen
@@ -200,8 +209,10 @@ fi
 # SIP-state branch.
 SCREENSHARINGD_PRESENT=0
 DID_WE_CHECKED_SCREENSHARINGD=0
+# Gate on DISPLAY_ATTACHED only — RUNNING_FROM_SSH is unreliable inside
+# tmate/tmux (env vars stripped) and DISPLAY_ATTACHED=0 is the meaningful
+# "is the user remote" signal regardless of transport.
 if [[ "$DISPLAY_ATTACHED" -eq 0 \
-        && "$RUNNING_FROM_SSH" -eq 1 \
         && -f /System/Library/LaunchDaemons/com.apple.screensharing.plist ]]; then
     SCREENSHARINGD_PRESENT=1
 fi
@@ -531,12 +542,12 @@ ensure_screensharingd() {
             # mode with no way to grant TCC remotely. Default-to-N on other hosts
             # (personal Mac with display) where the user has alternative paths.
             local _vnc_essential=0
-            if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+            if [[ "$DISPLAY_ATTACHED" -eq 0 ]]; then
                 _vnc_essential=1
             fi
             local _start_prompt
             if [[ "$_vnc_essential" -eq 1 ]]; then
-                _start_prompt="[Y/n/l]   (default Y on this headless+SSH host)"
+                _start_prompt="[Y/n/l]   (default Y on this headless host)"
             else
                 _start_prompt="[y/N/l]"
             fi
@@ -638,10 +649,18 @@ EOF
 # server invocation so the bundle maintains a VNC connection.
 NEEDS_VNC_FOR_GRANT=0
 NEEDS_VNC_AS_DISPLAY_WARMER=0
-if [[ "$TCC_GRANTED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+# Gate on DISPLAY_ATTACHED rather than RUNNING_FROM_SSH. The SSH-flag was
+# being misled by tmate/tmux which strip SSH_CONNECTION from the inner
+# shell, so a real remote session could end up RUNNING_FROM_SSH=0 and skip
+# VNC bootstrap entirely — leaving the user with a frozen black screen.
+# DISPLAY_ATTACHED=0 alone is the meaningful "user can't see the screen"
+# signal: no physical display means VNC is the only way the user reaches
+# the desktop, regardless of how they got there (SSH, tmate, screen sharing
+# from another Mac, etc).
+if [[ "$TCC_GRANTED" -eq 0 && "$DISPLAY_ATTACHED" -eq 0 ]]; then
     NEEDS_VNC_FOR_GRANT=1
 fi
-if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+if [[ "$DISPLAY_ATTACHED" -eq 0 ]]; then
     NEEDS_VNC_AS_DISPLAY_WARMER=1
 fi
 VNC_FALLBACK=0
