@@ -1219,33 +1219,60 @@ else
     # bundle's --enable-vnc-fallback bridge keeps gui/$UID alive across
     # reboots — subsequent install.sh / setup.sh runs Just Work.
     _bootstrap_out="$(launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1 || true)"
+    LOAD_DOMAIN=""
     if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
         LOAD_DOMAIN="gui/$(id -u)"
         green "  Loaded into ${LOAD_DOMAIN}"
     elif echo "$_bootstrap_out" | grep -qiE "Domain does not support|125:"; then
-        _mac_ip="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
-        red    "  ┌─ ONE-TIME LOGIN REQUIRED — macOS security boundary ──────────────┐"
-        yellow "  │  This Mac has no Aqua session yet (console user is 'root',         │"
-        yellow "  │  i.e. loginwindow is waiting for someone to log in). macOS         │"
-        yellow "  │  requires a real loginwindow authentication to create gui/${MACOS_USER}      │"
-        yellow "  │  — software-side VNC tricks can't bypass this (we tried).         │"
-        yellow "  │                                                                     │"
-        yellow "  │  ONE-TIME FIX from any other Mac on the network or your laptop:    │"
-        yellow "  │                                                                     │"
-        yellow "  │    1. Open Finder, press ⌘K (Connect to Server)                    │"
-        yellow "  │    2. Enter:  vnc://${_mac_ip}:5900                                │"
-        yellow "  │    3. Authenticate as user '${MACOS_USER}' with your macOS password           │"
-        yellow "  │    4. The Mac's desktop will appear. You don't need to do anything │"
-        yellow "  │       inside it — just having logged in is what creates gui/${MACOS_USER}.    │"
-        yellow "  │    5. Disconnect Screen Sharing, then come back here and run:      │"
-        yellow "  │         bash <(curl -fsSL https://raw.githubusercontent.com/${MACOS_USER}/${MACOS_USER}/main/install.sh)   │"
-        yellow "  │                                                                     │"
-        yellow "  │  After this one-time login, every future setup.sh run will boot    │"
-        yellow "  │  cleanly: the bundle's --enable-vnc-fallback bridge maintains      │"
-        yellow "  │  gui/${MACOS_USER} indefinitely (across reboots, kernel updates, etc).        │"
-        red    "  └─────────────────────────────────────────────────────────────────────┘"
-        unset _mac_ip
-        die "Bootstrap aborted — log in once via Screen Sharing.app then re-run."
+        # gui/$UID doesn't exist yet — happens on cloud Macs where nobody
+        # has logged in via the console. macOS requires an actual
+        # loginwindow authentication to create gui/$UID; we can't bypass
+        # that. BUT we CAN run the bundle in foreground VNC-bridge mode
+        # (no LaunchAgent, no gui/$UID needed) — the browser-VNC view
+        # provides exactly the access the user needs to grant TCC.
+        #
+        # Verified live: --vnc-only foreground spawn works on Scaleway
+        # without gui/$UID (--enable-vnc-fallback / auto mode does NOT,
+        # because the SCK upgrade path tries to spawn a compositor-
+        # keepalive subprocess via Launch Services which fails with the
+        # same rc=125).
+        if [[ -n "$MACOS_PASS" ]]; then
+            yellow "  gui/$(id -u) doesn't exist (no console login on this Mac yet)."
+            yellow "  Falling back to FOREGROUND VNC-bridge mode — gives you the"
+            yellow "  browser remote-desktop access RIGHT NOW so you can grant TCC,"
+            yellow "  without needing a one-time Apple-Screen-Sharing.app login first."
+            yellow "  After granting TCC and connecting from another Mac via Screen"
+            yellow "  Sharing once (creates gui/$(id -u)), re-run setup.sh for the"
+            yellow "  persistent LaunchAgent install."
+            # Pre-clear any lingering bundle process; otherwise port 6081 is busy.
+            pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+            sleep 1
+            nohup "$LAUNCHAGENT_BINARY" \
+                --listen "$LISTEN" --port "$PORT" --password "$MVS_PASSWORD" \
+                --max-fps "$MAX_FPS" --codec "$CODEC" \
+                --vnc-only \
+                --macos-user "$MACOS_USER" --macos-pass "$MACOS_PASS" \
+                > "$LOG_PATH" 2>&1 &
+            _fg_pid=$!
+            disown "$_fg_pid" 2>/dev/null || true
+            green "  Spawned bundle as foreground process (pid $_fg_pid)"
+            echo -n "  Waiting for server to bind :$PORT"
+            WAITED=0
+            while [[ $WAITED -lt 15 ]]; do
+                if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then echo; green "  Server up on :$PORT"; break; fi
+                sleep 1; WAITED=$((WAITED + 1)); echo -n "."
+            done
+            [[ $WAITED -ge 15 ]] && yellow "  Server slow to start — check $LOG_PATH"
+            LOAD_DOMAIN="foreground (pid $_fg_pid)"
+            FOREGROUND_MODE=1
+            unset _fg_pid WAITED
+        else
+            die "launchctl bootstrap into gui/$(id -u) failed (no Aqua session)
+and no --macos-pass available for foreground VNC-bridge fallback. Either:
+  • Re-run with --macos-pass=<your-password>, OR
+  • Log in once via Apple Screen Sharing.app to vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
+    then re-run setup.sh"
+        fi
     else
         die "launchctl bootstrap into gui/$(id -u) failed: $_bootstrap_out"
     fi
@@ -1271,7 +1298,7 @@ fi
 # Headless mode: skip the interactive wait. The user re-runs setup.sh when
 # they're ready to transition (or the bootstrap state runs indefinitely
 # until they do — VNC stays available).
-if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0 ]]; then
+if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0 && "${FOREGROUND_MODE:-0}" -eq 0 ]]; then
     MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
     URL="http://localhost:${PORT}/?token=${MVS_PASSWORD}"
     if [[ "$LISTEN" == "127.0.0.1" ]]; then
@@ -1457,6 +1484,30 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     fi
 fi
 
+# ── Step 9c: Foreground-mode banner (skipped LaunchAgent path) ──────────────
+# When Step 9 fell through to nohup spawn (no gui/$UID, --vnc-only forced),
+# the bundle is running NOT as a LaunchAgent. It works for the immediate
+# session, but won't survive reboot until we can do a proper LaunchAgent
+# install — which requires the user to log in once via Apple Screen
+# Sharing.app to create gui/$UID. Tell the user clearly.
+if [[ "${FOREGROUND_MODE:-0}" -eq 1 ]]; then
+    echo
+    yellow "  ┌─ FOREGROUND BUNDLE — NOT YET PERSISTENT ─────────────────────────┐"
+    yellow "  │  Bundle is running as a regular process (not a LaunchAgent),     │"
+    yellow "  │  in VNC-bridge mode. Open the URL in your browser via SSH tunnel │"
+    yellow "  │  to see the desktop, then grant Screen Recording + Accessibility │"
+    yellow "  │  for 'mac-vnc-stream' in System Settings ▸ Privacy & Security.   │"
+    yellow "  │                                                                    │"
+    yellow "  │  After granting, re-run install.sh / setup.sh — it'll attempt    │"
+    yellow "  │  the LaunchAgent install for persistence across reboots and      │"
+    yellow "  │  enable 60fps SCK capture (full-quality remote desktop).         │"
+    yellow "  │                                                                    │"
+    yellow "  │  This foreground process dies if the SSH session ends or the Mac │"
+    yellow "  │  reboots. To stop it manually: pkill -f mac-vnc-stream           │"
+    yellow "  └────────────────────────────────────────────────────────────────────┘"
+    echo
+fi
+
 # ── Step 10: TCC state check + final banner ───────────────────────────────────
 step "Connection info"
 MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
@@ -1552,5 +1603,9 @@ fi
 
 echo
 echo "  Log:    tail -f $LOG_PATH"
-echo "  Restart: launchctl kickstart -k ${LOAD_DOMAIN}/${LABEL}"
+if [[ "${FOREGROUND_MODE:-0}" -eq 1 ]]; then
+    echo "  Restart: pkill -f mac-vnc-stream && bash setup.sh"
+else
+    echo "  Restart: launchctl kickstart -k ${LOAD_DOMAIN}/${LABEL}"
+fi
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
