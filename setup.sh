@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # setup.sh — install mac-vnc-stream from this git checkout.
 #
-# Policy:
-#   SIP disabled  → install raw LaunchAgent → server.py
-#                   (TCC bypassed, no .app bundle needed; fastest path,
-#                    used by GitHub macOS runners and custom-imaged dev Macs)
+# Policy: always build the .app bundle (~3–5 min first run, cached after)
+# and install a LaunchAgent that launches the bundle binary. We run as
+# com.macvncstream.server, NOT as the shared Python interpreter, so:
 #
-#   SIP enabled   → build .app bundle via py2app (~5–10 min on first run)
-#                   → install LaunchAgent → bundle binary
-#                   (TCC enforces grants by bundle id; we run as
-#                    com.macvncstream.server, NOT as the Python interpreter,
-#                    so users grant permissions only to this app — never to
-#                    the shared interpreter that any other Python script
-#                    could exploit)
+#   • TCC tracks grants against OUR bundle id, not com.apple.python3
+#     (Tahoe explicitly refuses to honor Screen Recording grants for
+#     interpreters; bundle id escapes that restriction)
+#   • users grant permissions only to this app — not to the shared
+#     interpreter that any other Python script on the system could exploit
+#   • the same install path works on every macOS: SIP-on, SIP-off,
+#     personal Mac, headless cloud Mac, GitHub macOS runner. SIP-off does
+#     NOT disable TCC enforcement; running the interpreter directly is
+#     fragile in all cases.
 #
 # Headless / scripted use:
 #   Pass --headless or set MVS_HEADLESS=1 to skip all interactive prompts.
@@ -73,9 +74,9 @@ setup.sh — install mac-vnc-stream from this git checkout.
   --max-fps N        encoder fps cap (default 60)
   --codec NAME       h264 | h265 | jpeg (default h264)
   --headless         no prompts, sensible defaults (or MVS_HEADLESS=1)
-  --no-launchagent   skip the LaunchAgent install — build bundle (if SIP on)
-                     and write the plist template, but don't bootstrap. Useful
-                     for audit/preview, or when you'll launch the bundle manually.
+  --no-launchagent   skip the LaunchAgent install — build bundle and write
+                     the plist template, but don't bootstrap. Useful for audit
+                     /preview, or when you'll launch the bundle manually.
 
 Reads MVS_HEADLESS, MACOS_PASS, MVS_PASSWORD from env if unset.
 
@@ -100,20 +101,16 @@ echo "  Repo:    $REPO_DIR"
 echo "  User:    $MACOS_USER"
 echo "  Headless: $([[ $HEADLESS -eq 1 ]] && echo yes || echo no)"
 
-# ── Step 1: Detect macOS protection state ─────────────────────────────────────
-# SIP enabled → TCC is enforcing → we need a real bundle id (com.macvncstream.server)
-# SIP disabled → TCC is bypassed → can run server.py directly as the Python interpreter
+# ── Step 1: Detect macOS environment ──────────────────────────────────────────
+# TCC enforcement is mandatory on every modern macOS regardless of SIP state.
+# SIP-off does NOT disable TCC. The bundle path (com.macvncstream.server)
+# is the only reliable way to grant Screen Recording / Accessibility on
+# Sonoma+ and the only path that works at all on Tahoe (which refuses to
+# honor grants for interpreters like com.apple.python3). So we don't branch
+# on SIP — we always build and install the bundle.
 step "Detecting environment"
-SIP_DISABLED=0
-if csrutil status 2>&1 | grep -qi disabled; then
-    SIP_DISABLED=1
-    green "  SIP disabled — TCC enforcement bypassed (GH runner / custom-image Mac)"
-    green "  → will install raw LaunchAgent, no .app bundle needed"
-else
-    green "  SIP enabled — TCC will enforce permissions by bundle id"
-    green "  → will build .app bundle (com.macvncstream.server) so users grant"
-    green "    permissions to this app only, not the Python interpreter"
-fi
+green "  → will build .app bundle (com.macvncstream.server) so TCC tracks"
+green "    grants against this app, not the shared Python interpreter"
 
 # SSH-vs-local detection. Drives the VNC-fallback decision later: only
 # offer VNC when running over SSH (no physical screen access). Local
@@ -140,9 +137,11 @@ fi
 #   (b) screensharingd is actually installed on this Mac (its launchd
 #       plist exists). Cloud Macs that ship without it can't use this
 #       path regardless.
-# Independent of SIP state: SIP-off + headless still needs screensharingd
-# as the display warmer, and SIP-on + headless needs it both as
-# permission-grant viewer AND as display warmer.
+# screensharingd is needed on a headless Mac both as permission-grant
+# viewer (so the SSH user can navigate System Settings to grant TCC) AND
+# as display warmer (so SCK has a renderable display backend after grants
+# land). Both roles apply identically across all macs — there is no
+# SIP-state branch.
 SCREENSHARINGD_PRESENT=0
 DID_WE_CHECKED_SCREENSHARINGD=0
 if [[ "$DISPLAY_ATTACHED" -eq 0 \
@@ -298,11 +297,9 @@ _PYOBJC_FLAGS="${_PIP_FLAGS//--quiet/}"
     pyobjc-framework-AVFoundation pyobjc-framework-ScreenCaptureKit \
     || yellow "  PyObjC partial install — SCK may be limited"
 
-# Build deps only when SIP-enabled bundle path is taken.
-if [[ "$SIP_DISABLED" -eq 0 ]]; then
-    "$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS 'py2app>=0.28' setuptools \
-        || die "py2app install failed — required for the .app bundle build"
-fi
+# py2app is always required — the bundle is the only install path.
+"$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS 'py2app>=0.28' setuptools \
+    || die "py2app install failed — required for the .app bundle build"
 green "  Dependencies ready"
 
 # ── Step 4: Web UI access token ───────────────────────────────────────────────
@@ -323,13 +320,7 @@ TCC_GRANTED=0
 NEEDS_TCC_RESET=0
 # (SCREENSHARINGD_PRESENT and DID_WE_CHECKED_SCREENSHARINGD declared in env-detection step.)
 
-if [[ "$SIP_DISABLED" -eq 1 ]]; then
-    # SIP off: TCC isn't enforcing. Run server.py directly, no bundle.
-    TCC_GRANTED=1
-    REBUILD_NEEDED=0
-    LAUNCHAGENT_BINARY="$PYTHON_BINARY"
-    green "  SIP off → no bundle needed, raw LaunchAgent path"
-elif [[ -d "$APP_DEST" ]]; then
+if [[ -d "$APP_DEST" ]]; then
     step "Existing bundle"
     yellow "  Found: $APP_DEST"
     yellow "  Keep preserves grants (CDHash unchanged); rebuild picks up source"
@@ -441,19 +432,21 @@ ensure_screensharingd() {
 # ── Step 7: VNC fallback decision ────────────────────────────────────────────
 # VNC plays TWO different roles, both of which can independently require it:
 #
-#   ROLE 1: Permission-grant viewer (only when TCC enforcement is active).
-#     SIP enabled + TCC not yet granted + SSH session → user needs to view
-#     the desktop in a browser so they can navigate System Settings and
-#     toggle the grants. Without this, headless cloud Macs are stuck.
+#   ROLE 1: Permission-grant viewer.
+#     TCC not yet granted + SSH session → user needs to view the desktop
+#     in a browser so they can navigate System Settings and toggle the
+#     grants. Without this, headless cloud Macs are stuck. Once grants
+#     land, the running server auto-upgrades from VNC capture to SCK
+#     within ~30 s (server.py polls CGPreflightScreenCaptureAccess and
+#     hot-swaps the capture backend) — no setup.sh re-run needed.
 #
-#   ROLE 2: Display warmer (regardless of SIP state).
+#   ROLE 2: Display warmer.
 #     macOS releases the virtual display backend when no client is
 #     attached. SCK then captures stale or zero frames even if it's
 #     fully permitted. On a host with NO physical display
 #     (DISPLAY_ATTACHED=0, common on cloud Mac minis without a HDMI
 #     dongle), our bundle's VNC connection IS what keeps the display
-#     rendered. This applies even on SIP-off systems — TCC bypassed
-#     doesn't help if there's no display to capture in the first place.
+#     rendered.
 #
 # Either role triggers VNC_FALLBACK=1, which means setup.sh will
 # (1) ensure screensharingd is running, (2) prompt for a password if
@@ -461,7 +454,7 @@ ensure_screensharingd() {
 # server invocation so the bundle maintains a VNC connection.
 NEEDS_VNC_FOR_GRANT=0
 NEEDS_VNC_AS_DISPLAY_WARMER=0
-if [[ "$SIP_DISABLED" -eq 0 && "$TCC_GRANTED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+if [[ "$TCC_GRANTED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
     NEEDS_VNC_FOR_GRANT=1
 fi
 if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
@@ -524,7 +517,7 @@ fi
 unset _vnc_reason
 
 # Optional MDM TCC profile detection (informational only — no auto-action).
-if [[ "$SIP_DISABLED" -eq 0 && -n "${MACOS_PASS:-}" ]]; then
+if [[ -n "${MACOS_PASS:-}" ]]; then
     yellow "  About to run 'sudo profiles show' (read-only) to check for MDM TCC management..."
     if echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null \
             | grep -q "com.apple.TCC.configuration-profile-policy"; then
@@ -535,7 +528,7 @@ if [[ "$SIP_DISABLED" -eq 0 && -n "${MACOS_PASS:-}" ]]; then
 fi
 
 # ── Step 8: Build/install bundle if needed ────────────────────────────────────
-if [[ "$REBUILD_NEEDED" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
+if [[ "$REBUILD_NEEDED" -eq 1 ]]; then
     step "Building .app bundle (com.macvncstream.server)"
     rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
     (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 | tail -10)
@@ -560,7 +553,7 @@ if [[ "$REBUILD_NEEDED" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
 fi
 
 # ── Step 9: tccutil reset if needed (rebuild OR stale-CDHash-on-keep) ────────
-if [[ "$NEEDS_TCC_RESET" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
+if [[ "$NEEDS_TCC_RESET" -eq 1 ]]; then
     echo
     yellow "  Resetting TCC for com.macvncstream.server (CDHash mismatch)..."
     yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
@@ -602,7 +595,6 @@ write_plist() {
     local args=(
         "$LAUNCHAGENT_BINARY"
     )
-    [[ "$SIP_DISABLED" -eq 1 ]] && args+=("$REPO_DIR/server.py")
     args+=(
         --listen "$LISTEN"
         --port "$PORT"
@@ -829,9 +821,7 @@ MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/nu
 # would check setup.sh's identity (bash) which doesn't match com.macvncstream.server,
 # so the result would always be False even when the bundle's grants ARE valid.
 TCC_OK=0
-if [[ "$SIP_DISABLED" -eq 1 ]]; then
-    TCC_OK=1
-elif [[ -n "$APP_BUILT" ]] && "$APP_BUILT/Contents/MacOS/mac-vnc-stream" --tcc-check 2>/dev/null; then
+if [[ -n "$APP_BUILT" ]] && "$APP_BUILT/Contents/MacOS/mac-vnc-stream" --tcc-check 2>/dev/null; then
     TCC_OK=1
 fi
 
@@ -849,9 +839,7 @@ else
 fi
 echo
 
-if [[ "$SIP_DISABLED" -eq 1 ]]; then
-    green "  Mode: raw LaunchAgent → server.py (SIP disabled, TCC bypassed)"
-elif [[ "$TCC_OK" -eq 1 ]]; then
+if [[ "$TCC_OK" -eq 1 ]]; then
     green "  Mode: SCK 60fps + CGEvent input via signed bundle"
     green "  Bundle id: ${LABEL} — TCC has honored your grants. Production path."
 else
