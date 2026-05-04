@@ -183,16 +183,25 @@ if [[ -z "$MVS_PASSWORD" ]]; then
 fi
 
 # ── Step 5: Decide on optional VNC bootstrap fallback ─────────────────────────
-# VNC fallback is helpful on cloud Macs where the user has no physical screen
-# and needs to view the desktop via VNC for a few minutes to grant TCC. It
-# requires the macOS login password (AppleDH auth, stored in the plist).
+# VNC fallback serves two roles, both important on headless cloud Macs:
 #
-# On personal Macs (with a physical screen) the user just grants permissions
-# at the keyboard — no VNC fallback needed.
+#   1. BOOTSTRAP — let the user view the desktop via VNC long enough to
+#      grant Screen Recording / Accessibility in System Settings.
+#   2. DISPLAY WARMER — on a Mac with NO physical display attached
+#      (Scaleway, AWS EC2 Mac without HDMI dongle), SCK reports "no
+#      displays" unless something is keeping screensharingd's virtual
+#      display rendered. Our own VNC connection counts. Without it,
+#      SCK frames go stale even when TCC is granted ("frozen screen"
+#      pattern verified 2026-05-04 on Scaleway M2 Tahoe).
 #
-# Logic: if screensharingd is already listening on :5900 AND user provides a
-# password (or MACOS_PASS is set in env), enable VNC fallback. Empty password
-# = "I don't need VNC".
+# Logic: if screensharingd is listening on :5900 AND user provides a
+# password (or MACOS_PASS is set in env), enable VNC. Empty password =
+# "I have a physical display, no VNC needed" — bundle runs --api-only.
+#
+# Personal Macs with physical display: empty password → --api-only.
+# Cloud Macs (any cloud provider): provide password → bundle keeps VNC
+# alive permanently as the display warmer; SCK becomes the capture
+# path once granted.
 WANTS_VNC=0
 if nc -z 127.0.0.1 5900 2>/dev/null; then
     if [[ "$HEADLESS" -eq 1 ]]; then
