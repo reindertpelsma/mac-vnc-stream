@@ -306,8 +306,11 @@ LAUNCHAGENT_ARGS+=(
     --max-fps "$MAX_FPS"
     --codec "$CODEC"
 )
-if [[ "$WANTS_VNC" -eq 0 ]]; then
-    LAUNCHAGENT_ARGS+=(--api-only)
+if [[ "$WANTS_VNC" -eq 1 ]]; then
+    # Server defaults to native APIs only (SCK + CGEvent, no VNC). Opt back
+    # in to the SCK→VNC and CGEvent→VNC auto-fallback paths for the headless
+    # cloud-Mac case where VNC also serves as the display warmer.
+    LAUNCHAGENT_ARGS+=(--enable-vnc-fallback)
 fi
 
 # Build PROG_ARGS_XML from the array.

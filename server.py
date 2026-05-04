@@ -23,9 +23,7 @@ from mvs.handler import make_http_handler, make_ws_handler
 from mvs.cgevent import _check_cg_kb, _poll_cg_kb
 import mvs.cgevent as _cge
 from mvs.keepalive import (_start_compositor_keepalive, _request_screen_capture_access,
-                            _request_accessibility, _check_screen_capture,
-                            start_console_user_watcher, _trigger_sck_tcc_registration,
-                            maybe_promote_to_launchagent)
+                            _request_accessibility, _check_screen_capture)
 from mvs.codec import _AV_OK
 
 
@@ -48,18 +46,30 @@ def parse_args():
     p.add_argument("--password", default=os.environ.get("MVS_PASSWORD",""),
                    help="Optional access token for WebSocket URL (?token=...)")
 
-    # Capture / input mode selection
+    # Capture / input mode selection.
+    #
+    # Default = native APIs only (sck + cgevent), no screensharingd contact.
+    # This matches the production --api-only behaviour: people running
+    # `python3 server.py` directly almost always want SCK and have grants set
+    # up; they do NOT want a daemon silently establishing a VNC connection
+    # to screensharingd in the background. To opt back into the VNC fallback
+    # for the headless-cloud-Mac bootstrap case (or to use the bundle as a
+    # display warmer), pass --enable-vnc-fallback explicitly. setup.sh adds
+    # that flag automatically when the user provides a macOS password.
     p.add_argument("--capture", choices=["auto","sck","vnc"],
-                   default=os.environ.get("CAPTURE_MODE","auto"),
-                   help="Screen capture mode: auto=SCK with VNC fallback, sck=SCK only, vnc=VNC only")
+                   default=os.environ.get("CAPTURE_MODE","sck"),
+                   help="Screen capture mode (default: sck — VNC requires --enable-vnc-fallback)")
     p.add_argument("--input", choices=["auto","cgevent","vnc"],
-                   default=os.environ.get("INPUT_MODE","auto"),
-                   help="Input mode: auto=CGEvent with VNC fallback, cgevent=CGEvent only, vnc=VNC only")
+                   default=os.environ.get("INPUT_MODE","cgevent"),
+                   help="Input mode (default: cgevent — VNC requires --enable-vnc-fallback)")
     # Convenience shortcuts
     p.add_argument("--vnc-only", action="store_true",
                    help="Force VNC for both capture and input (sets --capture vnc --input vnc)")
     p.add_argument("--api-only", action="store_true",
-                   help="Force native APIs only — no VNC at all (sets --capture sck --input cgevent)")
+                   help="(Now the default; kept as a no-op alias for backwards compatibility)")
+    p.add_argument("--enable-vnc-fallback", action="store_true",
+                   help="Opt-in: try SCK/CGEvent first, fall back to VNC. setup.sh sets this "
+                        "automatically when the user provides a macOS password (headless cloud Macs).")
     # screensharingd lifecycle management
     p.add_argument("--manage-screensharingd", action="store_true", default=None,
                    help="Auto-restart screensharingd when VNC stalls (default: on when macos_pass is set and VNC is needed)")
@@ -68,9 +78,15 @@ def parse_args():
 
     args = p.parse_args()
 
-    # Apply shortcuts
+    # Apply shortcuts.
     if args.vnc_only:
         args.capture = "vnc"; args.input = "vnc"
+    elif args.enable_vnc_fallback:
+        # Opt-in: enable the SCK→VNC and CGEvent→VNC auto-fallback paths.
+        # Without this flag we run native-API-only; with it we behave like
+        # the legacy "auto" defaults.
+        args.capture = "auto"; args.input = "auto"
+    # --api-only is now a no-op (default behaviour). Honour it harmlessly:
     if args.api_only:
         args.capture = "sck"; args.input = "cgevent"
 
@@ -81,6 +97,11 @@ def parse_args():
     elif args.manage_screensharingd is None:
         vnc_needed = (args.capture in ("auto","vnc") or args.input in ("auto","vnc"))
         args.manage_screensharingd = bool(vnc_needed and args.macos_pass)
+
+    # api_only attribute is still consumed by elsewhere in the codebase
+    # (server.py:_start_compositor_keepalive guard, etc.). Set it based on
+    # the resolved capture/input modes.
+    args.api_only = (args.capture == "sck" and args.input == "cgevent")
 
     return args
 
@@ -143,28 +164,8 @@ async def _main(cfg, ds=None, vnc=None):
         # Screen Recording / SCK capture — only try upgrade if not already running
         if cfg.capture != "vnc" and (bridge._d is None or not bridge._d.is_running()):
             asyncio.run_coroutine_threadsafe(_sck_upgrade(), loop)
-        # LaunchDaemon → LaunchAgent self-promotion. When SCK is granted AND
-        # gui/$UID accepts a bootstrap (i.e. user has logged in via VNC), the
-        # daemon writes a LaunchAgent plist + spawns a detached helper to
-        # migrate, then exits. No-op when not running as a daemon (see
-        # maybe_promote_to_launchagent for preconditions).
-        from mvs.keepalive import _find_console_uid
-        uid = _find_console_uid()
-        if uid is not None and maybe_promote_to_launchagent(uid):
-            import sys as _sys
-            log.info("Promotion scheduled — daemon exiting in 2s for clean migration")
-            loop.call_later(1.5, lambda: _sys.exit(0))
 
     TCCWatcher(on_tcc_change=_on_tcc_change).start()
-
-    # Console-user watcher: fires when a user logs in (e.g. VNC login on a
-    # headless cloud Mac). On login, trigger an SCShareableContent probe via
-    # `launchctl asuser <uid>` so TCC registers the Python binary in the
-    # Screen Recording list — the user can then enable it with one click
-    # instead of having to '+ Add' it by path.
-    def _on_user_login(uid):
-        _trigger_sck_tcc_registration()
-    start_console_user_watcher(_on_user_login)
 
     async with serve(handler, cfg.listen, cfg.port,
                      process_request=http_handler,
