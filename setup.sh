@@ -273,13 +273,11 @@ if [[ -n "${MACOS_PASS:-}" ]]; then
     unset _mdm_dump
 fi
 if [[ -n "$MDM_TCC_PROFILE_ID" ]]; then
-    # Try to find the *enrollment* profile too — that's the one we can actually
-    # remove. The MDM-pushed Settings profile (which contains the TCC policy)
-    # has installedByMDM=TRUE and Tahoe refuses local removal even when its
-    # removalDisallowed flag is FALSE. But removing the parent enrollment
-    # profile cascade-removes everything the MDM pushed. Verified on Scaleway
-    # M2 Tahoe 2026-05-04: removing com.github.micromdm.micromdm.enroll
-    # zeroed both system profiles in one shot.
+    # The MDM-pushed Settings profile (containing the TCC policy) has
+    # installedByMDM=TRUE; Tahoe refuses direct local removal even when its
+    # removalDisallowed flag is FALSE (verified Scaleway M2 2026-05-04). But
+    # removing the *parent enrollment profile* cascade-removes everything the
+    # MDM pushed. Find the enrollment profile id (type=com.apple.mdm).
     _enroll_id=$(echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null | \
         awk '/profileIdentifier:/{id=$NF} /com.apple.mdm$/{print id; exit}')
     echo
@@ -288,26 +286,71 @@ if [[ -n "$MDM_TCC_PROFILE_ID" ]]; then
     yellow "  Python interpreter is rarely whitelisted, so 'Allow Python' in"
     yellow "  System Settings ▸ Screen Recording will silently NOT take effect"
     yellow "  — the actual SCK call returns -3801 (TCC declined) regardless."
-    echo
-    yellow "  Two-step escape hatch (reversible — provider re-enrolls on next"
-    yellow "  reinstall):"
+
     if [[ -n "$_enroll_id" ]]; then
-        yellow "    1. sudo profiles -R -p $_enroll_id"
-        yellow "       (cascade-removes both the enrollment profile and the MDM"
-        yellow "        Settings/TCC profile; the latter alone refuses removal)"
+        echo
+        yellow "  I can remove the MDM enrollment for you. Side effects:"
+        yellow "    • Removes the enrollment profile + everything the MDM pushed"
+        yellow "      (Energy Saver, Login Window, screensaver settings, the TCC"
+        yellow "      policy itself — all reset to OS defaults)."
+        yellow "    • Wipes any Privacy grants the MDM was mediating, so you'll"
+        yellow "      need to re-toggle Python in Screen Recording afterwards."
+        yellow "    • Reversible — your provider re-enrolls on next reinstall, or"
+        yellow "      you can re-trigger MDM enrollment manually."
+        yellow "    • Will NOT touch your data, SSH keys, or installed software."
+        echo
+        # Default-N prompt. User must explicitly choose Y to proceed.
+        printf '  Remove the MDM and continue with the SCK upgrade? [y/N] '
+        read -r _ans
+        if [[ "$_ans" =~ ^[Yy]$ ]]; then
+            echo
+            green "  Removing MDM enrollment ($_enroll_id)..."
+            if echo "$MACOS_PASS" | sudo -S profiles -R -p "$_enroll_id" 2>&1; then
+                green "  Done. System now reports:"
+                profiles status 2>&1 | sed 's/^/    /'
+                echo
+                yellow "  Now open System Settings on the Mac (you can do it via VNC"
+                yellow "  in your browser tab — the Settings pane should already be"
+                yellow "  open from earlier) and toggle Python ON in:"
+                yellow "    Privacy & Security ▸ Screen Recording"
+                yellow "  When done, press Enter here to continue."
+                read -r _
+                # Re-run the TCC pre-check now that MDM is gone + user re-toggled.
+                if python3 - <<'PYEOF' 2>/dev/null
+import ctypes, sys
+cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+ax = ctypes.cdll.LoadLibrary(
+    "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+ax.AXIsProcessTrusted.restype = ctypes.c_bool
+sys.exit(0 if (cg.CGPreflightScreenCaptureAccess() and ax.AXIsProcessTrusted()) else 1)
+PYEOF
+                then
+                    TCC_BOTH_GRANTED=1
+                    green "  Both permissions confirmed — switching to --api-only path."
+                else
+                    yellow "  TCC pre-check still says not granted. Continuing with"
+                    yellow "  VNC bootstrap as fallback. The --api-only upgrade will"
+                    yellow "  retry on next setup.sh re-run after you've confirmed"
+                    yellow "  Python is toggled on in Screen Recording."
+                fi
+            else
+                yellow "  profiles -R failed. Continuing with VNC bootstrap."
+            fi
+        else
+            yellow "  Skipped. Continuing with VNC bootstrap. To do this manually"
+            yellow "  later: sudo profiles -R -p $_enroll_id"
+        fi
     else
-        yellow "    1. sudo profiles -R -p <enrollment-profile-id>"
-        yellow "       (find via 'sudo profiles show' — type=com.apple.mdm)"
+        yellow "  Could not auto-detect the enrollment profile. To remove manually:"
+        yellow "    sudo profiles show   # find the type=com.apple.mdm entry"
+        yellow "    sudo profiles -R -p <that-identifier>"
     fi
-    yellow "    2. Open System Settings ▸ Privacy & Security ▸ Screen Recording"
-    yellow "       and re-toggle Python (the previous grant is wiped with the MDM)."
-    yellow "    3. Re-run this setup.sh. The TCC pre-check should now skip the"
-    yellow "       VNC bootstrap and install the LaunchAgent in --api-only mode."
     echo
-    yellow "  Long-term fix: a signed .app bundle with our own bundle identity"
-    yellow "  (com.macvncstream.server) — sysadmins can whitelist that, they"
-    yellow "  can't whitelist com.apple.python3. Tracked separately."
-    unset _enroll_id
+    yellow "  Long-term fix: signed .app bundle with our own bundle identity"
+    yellow "  (com.macvncstream.server) — admins can whitelist that, can't"
+    yellow "  whitelist com.apple.python3. Tracked separately."
+    unset _enroll_id _ans
 fi
 
 # ── Step 2: Find the best Python binary ───────────────────────────────────────
