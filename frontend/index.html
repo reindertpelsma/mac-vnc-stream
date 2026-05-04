@@ -832,14 +832,32 @@ window.addEventListener('mouseup',e=>{
   send({t:'mu',b:e.button,x:vx,y:vy});
 });
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
+// Wheel events come at very different magnitudes depending on input device:
+//   • Old mouse wheel (deltaMode=1): one notch = deltaY 1, mul×40 → 40 px
+//   • Trackpad pixel scroll (deltaMode=0): tiny per-frame deltas (1–10 px),
+//     including a long inertia tail of ~1 px each
+// Previous version Math.round-ed (deltaY * mul) / 80 to integer "clicks",
+// which silently dropped any deltas under 40 px. The trackpad inertia
+// tail and the small individual events were lost — only ~25% of scroll
+// intent registered. Fix: accumulate residual pixels across events,
+// emit a click when the accumulator crosses STEP. This matches how
+// browsers themselves convert smooth scrolls to discrete lines.
+let _scrollAccumX=0,_scrollAccumY=0;
+const _SCROLL_STEP_PX=40;  // pixels per emitted click; lower = more sensitive
 canvas.addEventListener('wheel',e=>{
   const[vx,vy]=_plockActive?[Math.round(_plockVX),Math.round(_plockVY)]:toVNC(e.clientX,e.clientY);
-  // Normalize to integer click-counts: deltaMode 0=pixels, 1=lines(×40), 2=page(×800)
-  // _scrollMul is the user sensitivity multiplier (0.25–3×, default 1).
   const mul=e.deltaMode===1?40:e.deltaMode===2?800:1;
-  const norm=v=>{if(!v)return 0;const m=Math.round(Math.abs(v*mul*_scrollMul)/80);return m?Math.sign(v)*Math.min(24,Math.max(1,m)):0;};
-  const cy=norm(e.deltaY),cx=norm(e.deltaX);
-  if(cy||cx)send({t:'sc',x:vx,y:vy,dy:cy,dx:cx});
+  _scrollAccumY += e.deltaY * mul * _scrollMul;
+  _scrollAccumX += e.deltaX * mul * _scrollMul;
+  let cy=Math.trunc(_scrollAccumY/_SCROLL_STEP_PX);
+  let cx=Math.trunc(_scrollAccumX/_SCROLL_STEP_PX);
+  _scrollAccumY -= cy*_SCROLL_STEP_PX;
+  _scrollAccumX -= cx*_SCROLL_STEP_PX;
+  if(cy||cx){
+    cy=Math.sign(cy)*Math.min(24,Math.abs(cy));
+    cx=Math.sign(cx)*Math.min(24,Math.abs(cx));
+    send({t:'sc',x:vx,y:vy,dy:cy,dx:cx});
+  }
   e.preventDefault();
 },{passive:false});
 
