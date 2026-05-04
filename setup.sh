@@ -116,40 +116,64 @@ fi
 # ── Step 2: Find the best Python ──────────────────────────────────────────────
 step "Finding Python 3.9+"
 
-_PY_DETECT="$(mktemp /tmp/mvs_pydetect_XXXXXX.py)"
-cat > "$_PY_DETECT" <<'PYEOF'
-import os, sys, subprocess, shutil
-def is_python_ok(p):
-    try:
-        out = subprocess.run([p, "-c", "import sys; print(sys.version_info[:2])"],
-                             capture_output=True, text=True, timeout=5)
-        return out.returncode == 0 and "3," in out.stdout and int(out.stdout.split(",")[1].strip(" )")) >= 9
-    except Exception:
-        return False
-candidates = []
-# Xcode-bundled Python.app (Apple-signed, has PyObjC built-in, can receive TCC grants).
-for p in [
-    '/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python',
-    '/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python',
-    '/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python',
-    '/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python',
-]:
-    if os.path.isfile(p) and p not in candidates: candidates.append(p)
-# Homebrew / pyenv / system python3 fallbacks.
-for name in ['python3.13', 'python3.12', 'python3.11', 'python3.10', 'python3.9', 'python3']:
-    p = shutil.which(name)
-    if p and p not in candidates: candidates.append(p)
-for c in candidates:
-    if is_python_ok(c):
-        print(c); sys.exit(0)
-sys.exit(1)
-PYEOF
-PYTHON_BINARY="$(python3 "$_PY_DETECT" 2>/dev/null || true)"
-rm -f "$_PY_DETECT"
+# Pure-bash candidate scan — works even when there's no `python3` on PATH yet
+# (fresh macOS without Xcode CLT). Each candidate is invoked directly with a
+# version-check stdin program; first one that returns 0 wins.
+_PYTHON_VER_CHECK='import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)'
+PYTHON_BINARY=""
+PY_CANDIDATES=(
+    # Apple-signed Xcode CLT Python.app paths (preferred — has PyObjC built-in,
+    # is what TCC has historically tracked, ad-hoc-sign-friendly via py2app).
+    /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/Resources/Python.app/Contents/MacOS/Python
+    /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.11/Resources/Python.app/Contents/MacOS/Python
+    /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python
+    /Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python
+    # Homebrew / pyenv / system pythons in PATH order.
+    "$(command -v python3.13 2>/dev/null)"
+    "$(command -v python3.12 2>/dev/null)"
+    "$(command -v python3.11 2>/dev/null)"
+    "$(command -v python3.10 2>/dev/null)"
+    "$(command -v python3.9 2>/dev/null)"
+    "$(command -v python3 2>/dev/null)"
+)
+for cand in "${PY_CANDIDATES[@]}"; do
+    [[ -z "$cand" || ! -x "$cand" ]] && continue
+    if "$cand" -c "$_PYTHON_VER_CHECK" 2>/dev/null; then
+        PYTHON_BINARY="$cand"
+        break
+    fi
+done
 
 if [[ -z "$PYTHON_BINARY" ]]; then
-    die "No suitable Python 3.9+ binary found.
-Install Xcode Command Line Tools (xcode-select --install) or Homebrew Python."
+    # Most likely Xcode Command Line Tools isn't installed yet (common on a
+    # fresh-image cloud Mac). Offer to trigger the official installer rather
+    # than just dying — a one-line `xcode-select --install` pops the system
+    # GUI dialog where the user clicks Install. ~5 minute download.
+    yellow "  No Python 3.9+ found on this Mac."
+    yellow "  Most likely: Xcode Command Line Tools isn't installed yet —"
+    yellow "  Apple ships macOS without /usr/bin/python3 by default."
+    echo
+    if [[ "$HEADLESS" -eq 1 ]]; then
+        die "Headless mode and no Python found. Install one of these manually:
+  • Xcode Command Line Tools:  xcode-select --install
+  • Homebrew Python:           brew install python@3.12
+Then re-run setup.sh."
+    fi
+    yellow "  About to run:  xcode-select --install"
+    yellow "  This pops the official Apple installer dialog on the Mac's display"
+    yellow "  (visible via VNC if you're remote). Click Install, agree to the"
+    yellow "  license, wait ~5 min for it to finish, then re-run setup.sh."
+    echo
+    read -rp "  Trigger the CLT installer now? [Y/n] " _ans
+    if [[ ! "$_ans" =~ ^[Nn]$ ]]; then
+        xcode-select --install 2>&1 | head -5 || true
+        echo
+        yellow "  CLT installer dialog launched."
+        yellow "  After it finishes (clicked Install + agree + Done), re-run:"
+        yellow "    bash setup.sh"
+        exit 0
+    fi
+    die "No Python — install CLT or Homebrew Python and re-run setup.sh."
 fi
 green "  Python: $PYTHON_BINARY"
 
