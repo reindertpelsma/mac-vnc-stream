@@ -235,11 +235,31 @@ if [[ "$VNC_PRESEEDED" -eq 1 && "$TCC_BOTH_GRANTED" -eq 0 ]]; then
         read -rsp "  macOS login password: " MACOS_PASS
         echo
     fi
-    if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
-        green "  Password verified"
-    else
-        yellow "  Could not validate password with sudo — screensharingd restart may fail"
-    fi
+    # Validate; on failure, re-prompt up to 2 more times. Empty input at any
+    # prompt skips validation and continues without sudo (some features
+    # degraded — screensharingd can't be restarted, MDM can't be removed).
+    _attempts=0
+    while true; do
+        if [[ -z "$MACOS_PASS" ]]; then
+            yellow "  No password provided — continuing without sudo capability."
+            yellow "  (screensharingd restart and MDM removal will be unavailable.)"
+            break
+        fi
+        if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
+            green "  Password verified"
+            break
+        fi
+        _attempts=$((_attempts + 1))
+        if [[ $_attempts -ge 3 ]]; then
+            yellow "  Three attempts failed. Continuing without sudo capability."
+            MACOS_PASS=""
+            break
+        fi
+        yellow "  Password rejected by sudo. Try again (or press Enter to skip)."
+        read -rsp "  macOS login password: " MACOS_PASS
+        echo
+    done
+    unset _attempts
 else
     # Fresh Mac: no password needed — screensharingd cannot capture without TCC.
     # sudo still available via the system prompt if the user has passwordless sudo.
