@@ -537,16 +537,36 @@ else
 fi
 
 # ── Step 6b: Decide bootstrap vs production mode ──────────────────────────────
-# BOOTSTRAP mode (only when DID_REBUILD=1 AND VNC is available): write a
-# transient plist with --enable-vnc-fallback + MACOS_PASS in env. After the
-# user grants permissions, we rewrite the plist as production (no flag, no
-# password) and kickstart-restart. Production restarts thereafter never have
-# the password in the env.
+# BOOTSTRAP mode: write a transient plist with --enable-vnc-fallback +
+# MACOS_PASS in env. After the user grants permissions, we rewrite the plist
+# as production (no flag, no password) and bootstrap-restart. Production
+# restarts thereafter never have the password.
 #
 # Production mode: clean plist, no --enable-vnc-fallback, no MACOS_PASS env.
-# Used when bundle is unchanged (grants still valid) OR when no VNC is wanted.
+#
+# Bootstrap is needed when EITHER:
+#   (a) we just rebuilt the bundle (CDHash changed → grants invalidated)
+#   (b) we kept the existing bundle but TCC isn't actually granted yet
+#       — common case: user re-runs setup.sh after a previous incomplete
+#       attempt where they hadn't toggled in Settings.
+# In both cases, VNC fallback is needed iff the user provided MACOS_PASS
+# (otherwise we assume physical-display access and the user grants at the
+# keyboard).
 BOOTSTRAP_MODE=0
-if [[ "$DID_REBUILD" -eq 1 && "$WANTS_VNC" -eq 1 ]]; then
+TCC_ALREADY_OK=0
+if [[ "$SIP_DISABLED" -eq 1 ]]; then
+    TCC_ALREADY_OK=1   # SIP off → TCC isn't enforcing → effectively granted
+elif [[ "$DID_REBUILD" -eq 0 && -n "$LAUNCHAGENT_BINARY" && -x "$LAUNCHAGENT_BINARY" ]]; then
+    # Keep path: probe the existing bundle's TCC state by running it with
+    # --tcc-check. Exit 0 = both granted; non-zero = needs bootstrap.
+    if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
+        TCC_ALREADY_OK=1
+        green "  Existing bundle has both TCC grants — production mode"
+    else
+        yellow "  Existing bundle is missing TCC grants — bootstrap mode"
+    fi
+fi
+if [[ "$TCC_ALREADY_OK" -eq 0 && "$WANTS_VNC" -eq 1 ]]; then
     BOOTSTRAP_MODE=1
 fi
 

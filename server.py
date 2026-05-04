@@ -75,8 +75,35 @@ def parse_args():
                    help="Auto-restart screensharingd when VNC stalls (default: on when macos_pass is set and VNC is needed)")
     p.add_argument("--no-manage-screensharingd", action="store_true",
                    help="Disable auto-management of screensharingd")
+    p.add_argument("--tcc-check", action="store_true",
+                   help="Probe Screen Recording + Accessibility TCC for this bundle "
+                        "and exit 0 if both granted, 1 otherwise. Used by setup.sh "
+                        "to decide whether the keep-existing-bundle path needs the "
+                        "VNC bootstrap fallback (= grants missing).")
 
     args = p.parse_args()
+
+    # --tcc-check short-circuit. Runs before any heavy initialization so it's
+    # cheap to invoke and doesn't open ports / start threads / contact
+    # screensharingd. The mere act of running this binary registers our bundle
+    # with TCC, which is exactly what we want as a side effect — first-run
+    # registration so the bundle id appears in System Settings.
+    if args.tcc_check:
+        import sys as _sys, ctypes as _ct
+        try:
+            cg = _ct.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+            cg.CGPreflightScreenCaptureAccess.restype = _ct.c_bool
+            ax = _ct.cdll.LoadLibrary(
+                "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+            ax.AXIsProcessTrusted.restype = _ct.c_bool
+            sr_ok = bool(cg.CGPreflightScreenCaptureAccess())
+            ax_ok = bool(ax.AXIsProcessTrusted())
+            print("screen_recording=" + ("1" if sr_ok else "0"))
+            print("accessibility=" + ("1" if ax_ok else "0"))
+            _sys.exit(0 if (sr_ok and ax_ok) else 1)
+        except Exception as e:
+            print("tcc_check_error=" + str(e))
+            _sys.exit(2)
 
     # Apply shortcuts.
     if args.vnc_only:
