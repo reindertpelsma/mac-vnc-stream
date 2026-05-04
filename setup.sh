@@ -605,6 +605,12 @@ if [[ -n "${MACOS_PASS:-}" ]]; then
 fi
 
 # ── Step 8: Build/install bundle if needed ────────────────────────────────────
+# Capture whether a prior bundle existed BEFORE we sudo-rm it. Determines
+# whether the TCC reset is meaningful: on a fresh install (no prior bundle)
+# TCC.db has no entries for our bundle id, so tccutil reset would error
+# with "No such bundle identifier".
+HAD_PRIOR_BUNDLE=0
+[[ -d "$APP_DEST" ]] && HAD_PRIOR_BUNDLE=1
 if [[ "$REBUILD_NEEDED" -eq 1 ]]; then
     step "Building .app bundle (com.macvncstream.server)"
     rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
@@ -625,7 +631,12 @@ if [[ "$REBUILD_NEEDED" -eq 1 ]]; then
     APP_BUILT="$APP_DEST"
     LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/mac-vnc-stream"
     green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
-    NEEDS_TCC_RESET=1   # CDHash changed → grants invalidated
+    # Only mark TCC reset needed when there were entries to invalidate.
+    # Fresh install (HAD_PRIOR_BUNDLE=0) → TCC.db has no rows for our bundle
+    # id; tccutil reset would fail with -10814 ("No such bundle identifier").
+    if [[ "$HAD_PRIOR_BUNDLE" -eq 1 ]]; then
+        NEEDS_TCC_RESET=1   # CDHash changed → grants invalidated
+    fi
     TCC_GRANTED=0
 fi
 
@@ -635,12 +646,15 @@ if [[ "$NEEDS_TCC_RESET" -eq 1 ]]; then
     yellow "  Resetting TCC for com.macvncstream.server (CDHash mismatch)..."
     yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
     yellow "    sudo tccutil reset Accessibility com.macvncstream.server"
+    # Tolerate non-zero exit: tccutil errors with -10814 when the bundle id
+    # has no entries in TCC.db (e.g. user manually wiped them between runs).
+    # Reset semantics in that case are already satisfied — nothing to clear.
     if [[ -n "$MACOS_PASS" ]]; then
-        echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
-        echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
+        echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1 || true
+        echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1 || true
     else
-        sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
-        sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
+        sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1 || true
+        sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1 || true
     fi
     green "  TCC reset — next toggle in Settings records current CDHash"
 fi
