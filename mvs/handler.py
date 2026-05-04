@@ -308,16 +308,25 @@ async def client_session(ws, cfg, bridge):
                                 continue  # client's view of Mac clipboard is stale — ignore
                         # Dock-button VNC bootstrap fallback: type each char via
                         # VNC keysyms when (a) the dock "Paste on Mac" button
-                        # set type_chars:true AND (b) we're in VNC mode (no
-                        # CGEvent). pbcopy + ClientCutText is unreliable from
-                        # the LaunchDaemon-context Cmd+V path; typing is the
-                        # only deterministic browser→remote injection on raw
-                        # screensharingd. Strictly additive: when type_chars
-                        # is absent (every Cmd+V keystroke path), execution
-                        # falls through to the unchanged pbcopy + Cmd+V flow
-                        # below — SCK/CGEvent paste behaviour is untouched.
+                        # set type_chars:true AND (b) capture is VNC (bridge
+                        # has no SCK display source). pbcopy from a
+                        # LaunchDaemon's system context can't reach the
+                        # user-session pasteboard server, so it silently
+                        # fails; ClientCutText is silently dropped by
+                        # screensharingd on macOS 15+. Typing each character
+                        # is the only deterministic browser→remote injection
+                        # in this mode. The CGEvent input path (Accessibility
+                        # granted) is irrelevant here — even with CGEvent,
+                        # Cmd+V still pastes the stale Mac clipboard, so
+                        # typing is the right choice when capture is VNC.
+                        # Strictly additive: when type_chars is absent (every
+                        # Cmd+V keystroke), execution falls through to the
+                        # unchanged pbcopy + Cmd+V flow — SCK paste behaviour
+                        # is byte-identical to before.
+                        _vnc_capture = (bridge._d is None
+                                        or not bridge._d.is_running())
                         if (t == "paste" and text and ev.get("type_chars")
-                                and not _cge._cg_kb_ok):
+                                and _vnc_capture):
                             for ch in text:
                                 if   ch == '\n': ks = 0xFF0D  # XK_Return
                                 elif ch == '\t': ks = 0xFF09  # XK_Tab
