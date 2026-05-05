@@ -12,25 +12,25 @@ The frame rate jump comes from switching capture backends: screensharingd is cap
 
 ## Browser compatibility
 
-| Browser | Video codec | Audio | Clipboard sync | Notes |
-|---------|------------|-------|---------------|-------|
-| Chrome 110+ | H.264, H.265, AV1 | ✅ | Full (live sync) | AV1 hardware requires M3+/A17 Pro |
-| Firefox 130+ | H.264 | ✅ | Read-only (Ctrl+V) | No H.265 WebCodecs |
-| Safari 26+ | H.265, H.264 | ✅ | Read-only (Ctrl+V) | H.265 selected automatically |
+| Browser | Video codec | Audio | Clipboard | Notes |
+|---------|------------|-------|-----------|-------|
+| Chrome 110+ | H.264, H.265, AV1 | ✅ | Live auto-sync (both directions) | AV1 hardware requires M3+/A17 Pro |
+| Firefox 130+ | H.264 | ✅ | Manual (Ctrl+V both directions) | No H.265 WebCodecs |
+| Safari 26+ | H.265, H.264 | ✅ | Manual (Ctrl+V both directions) | H.265 selected automatically |
+
+Clipboard works in both directions on every browser — the difference is whether sync is automatic or you press Ctrl+V. Chrome (with one-time permission grant) keeps the Mac and browser clipboards continuously aligned; Firefox and Safari paste with Ctrl+V into either side. A clipboard text box in the side menu also works as a manual fallback on every browser.
 
 The server negotiates the best codec the browser reports it supports. JPEG fallback is used only when WebCodecs is unavailable (rare).
 
 ## Tip: keep the screen non-static for best responsiveness
 
-macOS's WindowServer throttles the display compositor to ~3Hz when nothing is animating on screen. This causes 500ms–3s of first-keystroke latency — you type a character, the compositor is asleep, SCK has nothing to capture.
+This applies to both SCK and VNC paths — the throttle is in macOS itself, not in either capture backend. macOS's WindowServer drops the display compositor to ~3Hz when nothing is animating on screen. SCK reads frames out of that compositor; if the compositor is asleep, SCK has nothing to capture. So you type a character, wait for the compositor to wake, then see it appear — 500ms–3s of first-keystroke latency.
 
-The server runs a compositor keepalive subprocess (a near-invisible window driven by CVDisplayLink) that prevents this throttling. But if you notice sluggishness after a long idle period, simply **moving the mouse** or having any animation running (a terminal with a clock, a browser tab with activity) keeps the compositor warm and eliminates the latency entirely.
-
-This is a macOS WindowServer behavior, not a server bug. The keepalive handles it automatically in most cases.
+The server runs a compositor keepalive subprocess (a near-invisible window driven by CVDisplayLink) that prevents this throttling. In most cases you'll never notice. But if you do see sluggishness after a long idle period, **moving the mouse** or having any animation running (a terminal with a clock, a browser tab with activity) keeps the compositor warm and eliminates the latency entirely.
 
 ## Known limitations
 
-- **Screen must be unlocked.** Input events go to whatever is on screen, including the lock screen.
+- **Lock screen and login window are reachable from remote.** This is intentional — input events flow regardless of lock state, so you can unlock the Mac or log in from your browser tab. Both SCK and VNC paths can capture the loginwindow once Screen Recording is granted.
 - **Retina/HiDPI.** SCK captures at logical resolution (e.g. 1920×1080 on a 27" 5K display). Physical pixel counts above 4K will strain the encoder; use `--max-fps 30` on very high-res displays.
 - **HTTPS required for clipboard on LAN.** If you expose the server directly on a LAN (not via SSH tunnel), `navigator.clipboard.writeText` requires HTTPS. The SSH tunnel works around this by keeping everything on `localhost`.
 - **`--api-only` requires permissions already granted.** If Screen Recording or Accessibility haven't been granted yet, the server falls back to VNC automatically in `auto` mode.

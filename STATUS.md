@@ -40,10 +40,13 @@ guessing from commit timestamps alone.
 
 ## Known limitations
 
-See `README.md` ▸ "Known limitations" for the up-to-date list. The biggest
-ones are: screen must be unlocked, HiDPI displays cap useful fps, and
-clipboard sync needs HTTPS or a localhost SSH tunnel (browser API rule,
-not our limitation).
+See `docs/performance.md` ▸ "Known limitations" for the up-to-date list.
+The biggest ones are: HiDPI displays cap useful fps, clipboard sync needs
+HTTPS or a localhost SSH tunnel (browser API rule, not our limitation),
+and `--api-only` requires Screen Recording + Accessibility already
+granted (auto mode handles the bootstrap automatically). The lock screen
+and login window are reachable from remote by design — you can unlock
+or log in from the browser tab.
 
 ## Bus factor / what happens if I get hit by a bus
 
