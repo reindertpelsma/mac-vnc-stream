@@ -1,16 +1,16 @@
-"""build_app.py — produce mac-vnc-stream.app via py2app.
+"""build_app.py — produce macscreencast.app via py2app.
 
 Usage:
     python3 build_app.py py2app
 
 Output:
-    dist/mac-vnc-stream.app
+    dist/macscreencast.app
 
 Why this exists:
     macOS Tahoe (26+) refuses to honor Screen Recording grants for the
     Python interpreter (com.apple.python3) even when TCC.db says they're
     allowed. Bundling our server as a .app with our own bundle identifier
-    (com.macvncstream.server) escapes Tahoe's interpreter restriction —
+    (com.macscreencast.server) escapes Tahoe's interpreter restriction —
     TCC tracks our identity, not Apple's, and grants stick.
 
 After the build, the bundle is ad-hoc signed (codesign --sign -) so it has
@@ -43,13 +43,13 @@ DATA_FILES = [
     ('frontend', [str(REPO / 'frontend' / 'index.html')]),
 ]
 
-# CFBundleIdentifier is the TCC identity. com.macvncstream.server is unique
+# CFBundleIdentifier is the TCC identity. com.macscreencast.server is unique
 # to this project (not com.apple.anything), so Tahoe doesn't apply
 # interpreter-grant restrictions to it.
 PLIST = {
-    'CFBundleIdentifier':       'com.macvncstream.server',
-    'CFBundleName':             'mac-vnc-stream',
-    'CFBundleDisplayName':      'mac-vnc-stream',
+    'CFBundleIdentifier':       'com.macscreencast.server',
+    'CFBundleName':             'macscreencast',
+    'CFBundleDisplayName':      'macscreencast',
     'CFBundleShortVersionString': '0.1.0',
     'CFBundleVersion':          '0.1.0',
     'NSHighResolutionCapable':  True,
@@ -59,12 +59,12 @@ PLIST = {
     # we don't show our own dialogs, the system uses these strings when
     # presenting the Screen Recording / Accessibility consent UI.
     'NSScreenCaptureUsageDescription':
-        'mac-vnc-stream captures the screen so you can view it remotely in a browser.',
+        'macscreencast captures the screen so you can view it remotely in a browser.',
     'NSAppleEventsUsageDescription':
-        'mac-vnc-stream sends keyboard and mouse input to control this Mac remotely.',
+        'macscreencast sends keyboard and mouse input to control this Mac remotely.',
     # Inputs Monitoring is a related TCC class on macOS 14+; safe to declare.
     'NSInputMonitoringUsageDescription':
-        'mac-vnc-stream forwards browser keypresses and mouse events to this Mac.',
+        'macscreencast forwards browser keypresses and mouse events to this Mac.',
 }
 
 OPTIONS = {
@@ -118,7 +118,7 @@ def main():
 def _post_build_sign():
     """Ad-hoc sign the produced .app so TCC has a stable CDHash to track.
     Called after `python3 build_app.py py2app` succeeds."""
-    app_path = REPO / 'dist' / 'mac-vnc-stream.app'
+    app_path = REPO / 'dist' / 'macscreencast.app'
     if not app_path.is_dir():
         return
     print("\n==> Ad-hoc signing %s" % app_path)

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# install.sh — convenience installer for mac-vnc-stream.
+# install.sh — convenience installer for macscreencast.
 #
 # Two paths, attempted in order:
 #
 #   1. Pre-built release bundle (FAST PATH, ~10 s, requires a published
 #      GitHub release with a matching .app.tar.gz asset). The bundle has its
-#      own bundle id (com.macvncstream.server) so it works on Tahoe + on
+#      own bundle id (com.macscreencast.server) so it works on Tahoe + on
 #      MDM-managed Macs without granting the Python interpreter. After this
 #      lands, the user just toggles permissions and is done.
 #
@@ -17,11 +17,11 @@
 #      audit-conscious / airgapped users who don't want a downloaded binary.
 #
 # Both paths converge on the same end state: a LaunchAgent in gui/$UID
-# pointing at /Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream
+# pointing at /Applications/macscreencast.app/Contents/MacOS/macscreencast
 # (SIP-enabled hosts) or at python3 server.py directly (SIP-disabled hosts).
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/macscreencast/main/install.sh)
 #
 # With flags forwarded to setup.sh:
 #   bash <(curl ...) --port 6081 --listen 0.0.0.0 --headless
@@ -62,13 +62,13 @@ if [[ "$_OS" != "Darwin" ]]; then
 fi
 unset _OS
 
-REPO_URL="https://github.com/reindertpelsma/mac-vnc-stream"
-RELEASES_API="https://api.github.com/repos/reindertpelsma/mac-vnc-stream/releases/latest"
-CLONE_DIR="$HOME/mac-vnc-stream"
-APP_DEST="/Applications/mac-vnc-stream.app"
+REPO_URL="https://github.com/reindertpelsma/macscreencast"
+RELEASES_API="https://api.github.com/repos/reindertpelsma/macscreencast/releases/latest"
+CLONE_DIR="$HOME/macscreencast"
+APP_DEST="/Applications/macscreencast.app"
 
 # Headless / opt-out parsing.
-HEADLESS="${MVS_HEADLESS:-0}"
+HEADLESS="${MACSCREENCAST_HEADLESS:-0}"
 FORCE_BUILD_FROM_SOURCE=0
 PASSTHROUGH_ARGS=()
 for arg in "$@"; do
@@ -84,7 +84,7 @@ if [[ ! -t 0 ]] && [[ -e /dev/tty ]] && [[ "$HEADLESS" -eq 0 ]]; then
     exec </dev/tty
 fi
 
-step "mac-vnc-stream installer"
+step "macscreencast installer"
 echo "  Repo:           $REPO_URL"
 echo "  Headless:       $([[ $HEADLESS -eq 1 ]] && echo yes || echo no)"
 echo "  Force source:   $([[ $FORCE_BUILD_FROM_SOURCE -eq 1 ]] && echo yes || echo no)"
@@ -96,7 +96,7 @@ command -v curl >/dev/null 2>&1 || die "curl not found"
 if [[ "$FORCE_BUILD_FROM_SOURCE" -eq 0 ]]; then
     step "Looking for a pre-built release"
     ARCH="$(uname -m)"   # arm64 or x86_64
-    ASSET_NAME="mac-vnc-stream-${ARCH}.app.tar.gz"
+    ASSET_NAME="macscreencast-${ARCH}.app.tar.gz"
     RELEASE_TAG=""
     ASSET_URL=""
 
@@ -183,7 +183,7 @@ if [[ "$FORCE_BUILD_FROM_SOURCE" -eq 0 ]]; then
             curl -fsSL "$REPO_URL/raw/${RELEASE_TAG}/setup.sh" -o "$SETUP_TMP/setup.sh" \
                 || die "failed to fetch setup.sh from ${RELEASE_TAG}"
             chmod +x "$SETUP_TMP/setup.sh"
-            export MVS_PREBUILT_APP="$APP_DEST"
+            export MACSCREENCAST_PREBUILT_APP="$APP_DEST"
             exec bash "$SETUP_TMP/setup.sh" "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
         fi
     else
@@ -195,7 +195,7 @@ fi
 command -v git    >/dev/null 2>&1 || die "git not found. Run: xcode-select --install"
 command -v python3 >/dev/null 2>&1 || die "python3 not found. Run: xcode-select --install"
 
-step "Fetching mac-vnc-stream source"
+step "Fetching macscreencast source"
 if [[ -d "$CLONE_DIR/.git" ]]; then
     yellow "  Repo already at $CLONE_DIR — pulling latest"
     git -C "$CLONE_DIR" pull --ff-only \

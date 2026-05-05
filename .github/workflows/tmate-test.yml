@@ -51,9 +51,9 @@ jobs:
           nc -z 127.0.0.1 5900 && echo "screensharingd UP on :5900" || echo "screensharingd not listening"
 
       # ── Start the server ──────────────────────────────────────────────────
-      - name: Start mac-vnc-stream server
+      - name: Start macscreencast server
         env:
-          MVS_PASSWORD: citest
+          MACSCREENCAST_PASSWORD: citest
           MACOS_USER: runner
           MACOS_PASS: ""
         run: |
@@ -62,7 +62,7 @@ jobs:
             --port 6081 \
             --password citest \
             --no-manage-screensharingd \
-            > /tmp/macvncstream.log 2>&1 &
+            > /tmp/macscreencast.log 2>&1 &
           echo "Server PID: $!"
 
           echo -n "Waiting for HTTP server..."
@@ -76,7 +76,7 @@ jobs:
 
           echo ""
           echo "=== Server log (first 40 lines) ==="
-          head -40 /tmp/macvncstream.log || true
+          head -40 /tmp/macscreencast.log || true
 
           echo ""
           echo "=== Local token check ==="
@@ -132,7 +132,7 @@ jobs:
       # on the relay machine at http://localhost:16081/?token=citest
       #
       # Useful commands once connected:
-      #   tail -f /tmp/macvncstream.log
+      #   tail -f /tmp/macscreencast.log
       #   sudo launchctl list | grep screen
       #   nc -z 127.0.0.1 5900 && echo "VNC up"
       #   python3 -c 'import av; print(av.__version__)'

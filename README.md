@@ -1,4 +1,4 @@
-# mac-vnc-stream
+# macscreencast
 
 **Browser-based macOS remote desktop at up to 60fps, over SSH.**
 
@@ -7,7 +7,7 @@ No third-party accounts. No cloud relay. Just a Python script and a browser.
 > Solo project, ~140 commits, first public release. Read [`STATUS.md`](STATUS.md) for what's tested, what isn't, and what to expect.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/macscreencast/main/install.sh)
 ```
 
 Then from your laptop:
@@ -77,19 +77,19 @@ VNC (`screensharingd`, port 5900) is used **only as a bootstrap path** — long 
 
 ```bash
 # One command — installs everything, starts the server, triggers permission dialogs
-bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/macscreencast/main/install.sh)
 ```
 
 Review the script before running it:
 ```bash
-git clone https://github.com/reindertpelsma/mac-vnc-stream.git
-cd mac-vnc-stream
+git clone https://github.com/reindertpelsma/macscreencast.git
+cd macscreencast
 bash setup.sh
 ```
 
 Installing on a remote Mac over SSH — `-t` allocates a TTY so the password prompt works:
 ```bash
-ssh -t user@your-mac 'bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)'
+ssh -t user@your-mac 'bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/macscreencast/main/install.sh)'
 ```
 
 Connect from your laptop:

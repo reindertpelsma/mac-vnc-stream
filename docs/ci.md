@@ -1,6 +1,6 @@
-# Using mac-vnc-stream in CI (GitHub Actions / similar)
+# Using macscreencast in CI (GitHub Actions / similar)
 
-For ephemeral CI workloads — running tests against a live mac-vnc-stream server inside a workflow — **don't use `setup.sh` or `install.sh`**. Those target persistent installs (LaunchAgent + .app bundle + TCC grant ceremony). For CI you want short-lived, no-bundle, runs-once-per-job.
+For ephemeral CI workloads — running tests against a live macscreencast server inside a workflow — **don't use `setup.sh` or `install.sh`**. Those target persistent installs (LaunchAgent + .app bundle + TCC grant ceremony). For CI you want short-lived, no-bundle, runs-once-per-job.
 
 The right pattern: `pip install` Python deps, run `python3 server.py` directly as a child of the runner shell. On most hosted macOS CI runners (GitHub Actions's `macos-latest` definitely; others vary), the runner image pre-grants Screen Recording + Accessibility to `/bin/bash` or the runner agent. A `python3 server.py` child of the shell inherits those grants via TCC's responsible-app chain, so SCK + CGEvent work without any user grant ceremony or LaunchAgent dance.
 
@@ -17,11 +17,11 @@ Working example: [`.github/workflows/tmate-test.yml`](../.github/workflows/tmate
 - name: Enable screensharingd (gives SCK a display backend)
   run: sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
 
-- name: Start mac-vnc-stream server
+- name: Start macscreencast server
   run: |
     nohup python3 server.py --listen 127.0.0.1 --port 6081 \
       --password citest --no-manage-screensharingd \
-      > /tmp/macvncstream.log 2>&1 &
+      > /tmp/macscreencast.log 2>&1 &
     until nc -z 127.0.0.1 6081; do sleep 1; done
 
 - name: Run your tests against http://127.0.0.1:6081/?token=citest

@@ -65,8 +65,8 @@ jobs:
         run: |
           rm -rf build dist
           python3 build_app.py py2app 2>&1 | tail -20
-          test -d "dist/mac-vnc-stream.app" || { echo "py2app produced no .app"; exit 1; }
-          ls -la dist/mac-vnc-stream.app
+          test -d "dist/macscreencast.app" || { echo "py2app produced no .app"; exit 1; }
+          ls -la dist/macscreencast.app
 
       - name: Ad-hoc sign
         run: |
@@ -74,26 +74,26 @@ jobs:
           # track — necessary for grant persistence across runs. NOT --options
           # runtime: hardened runtime conflicts with mixed Apple+adhoc dylib
           # signatures (see project memory: macscreencast .app bundle plan).
-          codesign --force --deep --sign - dist/mac-vnc-stream.app
-          codesign -dvv dist/mac-vnc-stream.app 2>&1 | grep -E "Identifier|Authority|TeamIdentifier|Signature|Format"
+          codesign --force --deep --sign - dist/macscreencast.app
+          codesign -dvv dist/macscreencast.app 2>&1 | grep -E "Identifier|Authority|TeamIdentifier|Signature|Format"
 
       - name: Smoke test the bundle
         run: |
           # Confirm the bundle binary at least starts and responds to --help.
           # Doesn't validate SCK or TCC (those need user interaction); just
           # catches obvious dyld / py2app bundling regressions before publish.
-          dist/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream --help \
+          dist/macscreencast.app/Contents/MacOS/macscreencast --help \
             | head -5
 
       - name: Package
         id: package
         run: |
-          ARTIFACT="mac-vnc-stream-${{ env.ARCH }}.app.tar.gz"
+          ARTIFACT="macscreencast-${{ env.ARCH }}.app.tar.gz"
           # gzip-compressed tar so install.sh can pipe through tar -xzf.
           # -C dist/ + bare relative path keeps the archive's top-level
-          # entry as `mac-vnc-stream.app/...` (extracts cleanly into
+          # entry as `macscreencast.app/...` (extracts cleanly into
           # /Applications/ via `sudo tar -xzf $TAR -C /Applications/`).
-          tar -czf "$ARTIFACT" -C dist mac-vnc-stream.app
+          tar -czf "$ARTIFACT" -C dist macscreencast.app
           shasum -a 256 "$ARTIFACT" | tee "${ARTIFACT}.sha256"
           ls -la "$ARTIFACT" "${ARTIFACT}.sha256"
           echo "artifact=$ARTIFACT" >> "$GITHUB_OUTPUT"
@@ -101,18 +101,18 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mac-vnc-stream-${{ env.ARCH }}
+          name: macscreencast-${{ env.ARCH }}
           path: |
-            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz
-            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz.sha256
+            macscreencast-${{ env.ARCH }}.app.tar.gz
+            macscreencast-${{ env.ARCH }}.app.tar.gz.sha256
 
       - name: Attach to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz
-            mac-vnc-stream-${{ env.ARCH }}.app.tar.gz.sha256
+            macscreencast-${{ env.ARCH }}.app.tar.gz
+            macscreencast-${{ env.ARCH }}.app.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
         env:

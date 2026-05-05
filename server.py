@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-mac-vnc-stream: Adaptive H.264/H.265/JPEG macOS remote desktop in your browser over SSH.
+macscreencast: Adaptive H.264/H.265/JPEG macOS remote desktop in your browser over SSH.
 
 python server.py --vnc-pass PASSWORD
 python server.py --macos-user u --macos-pass p  # full control (macOS 15+)
@@ -28,7 +28,7 @@ from mvs.codec import _AV_OK
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="mac-vnc-stream server")
+    p = argparse.ArgumentParser(description="macscreencast server")
     p.add_argument("--vnc-host", default=os.environ.get("VNC_HOST","127.0.0.1"))
     p.add_argument("--vnc-port", type=int, default=int(os.environ.get("VNC_PORT","5900")))
     p.add_argument("--vnc-pass", default=os.environ.get("VNC_PASS",""))
@@ -43,7 +43,7 @@ def parse_args():
     p.add_argument("--codec", choices=["h264","h265","jpeg"],
                    default=os.environ.get("CODEC","h264"),
                    help="Video codec (default h264)")
-    p.add_argument("--password", default=os.environ.get("MVS_PASSWORD",""),
+    p.add_argument("--password", default=os.environ.get("MACSCREENCAST_PASSWORD",""),
                    help="Optional access token for WebSocket URL (?token=...)")
 
     # Capture / input mode selection.

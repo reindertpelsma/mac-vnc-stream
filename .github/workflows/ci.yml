@@ -23,14 +23,14 @@ jobs:
                pyobjc-framework-AVFoundation pyobjc-framework-ScreenCaptureKit \
                2>/dev/null && echo "PyObjC: installed" || echo "PyObjC: partial"
 
-      - name: Start mac-vnc-stream server
+      - name: Start macscreencast server
         run: |
           nohup python3 server.py \
             --listen 127.0.0.1 \
             --port 6081 \
             --password citest \
             --no-manage-screensharingd \
-            > /tmp/macvncstream.log 2>&1 &
+            > /tmp/macscreencast.log 2>&1 &
 
           echo -n "Waiting for server..."
           for i in $(seq 1 20); do
@@ -50,14 +50,14 @@ jobs:
           # fallback (which on the runner doesn't even have a working VNC
           # server unless explicitly started).
           sleep 3
-          if grep -qE "InProcessSCK: stream active|capture=SCK|SCK capture activated" /tmp/macvncstream.log; then
+          if grep -qE "InProcessSCK: stream active|capture=SCK|SCK capture activated" /tmp/macscreencast.log; then
             echo "✓ SCK capture is active — runner bash-grant inheritance still works"
-          elif grep -qE "SCStreamErrorDomain|user declined TCCs" /tmp/macvncstream.log; then
+          elif grep -qE "SCStreamErrorDomain|user declined TCCs" /tmp/macscreencast.log; then
             echo "✗ SCK denied (-3801) on the runner. The macos-latest image's"
             echo "  /bin/bash pre-grant of Screen Recording was the assumption — if"
             echo "  Apple has changed responsible-app inheritance behaviour, the"
             echo "  CI smoke needs an explicit grant injection step."
-            cat /tmp/macvncstream.log
+            cat /tmp/macscreencast.log
             exit 1
           else
             echo "? SCK status unclear in log; proceeding (smoke tests will catch a true regression)"
@@ -155,6 +155,6 @@ jobs:
         if: failure()
         run: |
           echo "=== Server log ==="
-          cat /tmp/macvncstream.log
+          cat /tmp/macscreencast.log
           echo "=== Animate log ==="
           cat /tmp/animate.log 2>/dev/null || echo "(no animate log)"

@@ -2,17 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <!--
-  LaunchAgent template for auto-starting mac-vnc-stream at login.
+  LaunchAgent template for auto-starting macscreencast at login.
 
   1. Replace PYTHON_PATH with: which python3  (or the full path to your venv python)
   2. Replace SERVER_PATH with the full path to server.py
   3. Set your VNC_PASS (or MACOS_USER/MACOS_PASS for full control)
-  4. Copy to ~/Library/LaunchAgents/com.macvncstream.server.plist
-  5. launchctl load ~/Library/LaunchAgents/com.macvncstream.server.plist
+  4. Copy to ~/Library/LaunchAgents/com.macscreencast.server.plist
+  5. launchctl load ~/Library/LaunchAgents/com.macscreencast.server.plist
 -->
 <dict>
   <key>Label</key>
-  <string>com.macvncstream.server</string>
+  <string>com.macscreencast.server</string>
 
   <key>ProgramArguments</key>
   <array>
@@ -31,7 +31,7 @@
     <key>VNC_PASS</key>
     <string>your_vnc_password_here</string>
     <!-- Optional web UI access token — visit http://localhost:6081/?token=SECRET -->
-    <!-- <key>MVS_PASSWORD</key>
+    <!-- <key>MACSCREENCAST_PASSWORD</key>
     <string>your_web_token_here</string> -->
     <!-- For full control (type-30), also set these and remove VNC_PASS:
     <key>MACOS_USER</key>
@@ -47,8 +47,8 @@
   <true/>
 
   <key>StandardOutPath</key>
-  <string>/tmp/macvncstream.log</string>
+  <string>/tmp/macscreencast.log</string>
   <key>StandardErrorPath</key>
-  <string>/tmp/macvncstream.log</string>
+  <string>/tmp/macscreencast.log</string>
 </dict>
 </plist>

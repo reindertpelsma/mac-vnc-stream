@@ -57,7 +57,7 @@ _LOGIN_HTML = b"""\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>mac-vnc-stream</title>
+<title>macscreencast</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{background:#111;color:#ddd;font-family:system-ui,sans-serif;
@@ -77,7 +77,7 @@ button:hover{background:#3b8fe0}
 </head>
 <body>
 <div class="card">
-  <h1>mac-vnc-stream</h1>
+  <h1>macscreencast</h1>
   <form method="get" action="/">
     <div style="display:flex;flex-direction:column;gap:.75rem">
       <input type="password" name="token" placeholder="Access token"

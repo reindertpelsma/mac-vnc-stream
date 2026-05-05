@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# setup.sh — install mac-vnc-stream from this git checkout.
+# setup.sh — install macscreencast from this git checkout.
 #
 # Policy: always build the .app bundle (~3–5 min first run, cached after)
 # and install a LaunchAgent that launches the bundle binary. We run as
-# com.macvncstream.server, NOT as the shared Python interpreter, so:
+# com.macscreencast.server, NOT as the shared Python interpreter, so:
 #
 #   • TCC tracks grants against OUR bundle id, not com.apple.python3
 #     (Tahoe explicitly refuses to honor Screen Recording grants for
@@ -16,7 +16,7 @@
 #     fragile in all cases.
 #
 # Headless / scripted use:
-#   Pass --headless or set MVS_HEADLESS=1 to skip all interactive prompts.
+#   Pass --headless or set MACSCREENCAST_HEADLESS=1 to skip all interactive prompts.
 #   Empty / unset MACOS_PASS is treated as "no VNC fallback wanted".
 #
 # Flags forwarded to the server (see server.py for full list):
@@ -40,12 +40,12 @@ PORT=6081
 LISTEN="127.0.0.1"
 MAX_FPS=60
 CODEC="h264"
-MVS_PASSWORD=""
+MACSCREENCAST_PASSWORD=""
 MACOS_PASS=""
 MACOS_USER="$(whoami)"
-HEADLESS="${MVS_HEADLESS:-0}"
-LABEL="com.macvncstream.server"
-LOG_PATH="/tmp/macvncstream.log"
+HEADLESS="${MACSCREENCAST_HEADLESS:-0}"
+LABEL="com.macscreencast.server"
+LOG_PATH="/tmp/macscreencast.log"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -58,7 +58,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)        PORT="$2"; shift 2 ;;
         --listen)      LISTEN="$2"; shift 2 ;;
-        --password)    MVS_PASSWORD="$2"; shift 2 ;;
+        --password)    MACSCREENCAST_PASSWORD="$2"; shift 2 ;;
         --macos-pass)  MACOS_PASS="$2"; shift 2 ;;
         --max-fps)     MAX_FPS="$2"; shift 2 ;;
         --codec)       CODEC="$2"; shift 2 ;;
@@ -76,7 +76,7 @@ while [[ $# -gt 0 ]]; do
         --no-bootstrap-wait) NO_BOOTSTRAP_WAIT=1; shift ;;
         -h|--help)
             cat <<HELP
-setup.sh — install mac-vnc-stream from this git checkout.
+setup.sh — install macscreencast from this git checkout.
 
   --port PORT        web listen port (default 6081)
   --listen ADDR      web bind addr (default 127.0.0.1)
@@ -85,7 +85,7 @@ setup.sh — install mac-vnc-stream from this git checkout.
                      bootstrap fallback is wanted; empty = no fallback)
   --max-fps N        encoder fps cap (default 60)
   --codec NAME       h264 | h265 | jpeg (default h264)
-  --headless         no prompts, sensible defaults (or MVS_HEADLESS=1)
+  --headless         no prompts, sensible defaults (or MACSCREENCAST_HEADLESS=1)
   --no-launchagent   skip the LaunchAgent install — build bundle and write
                      the plist template, but don't bootstrap. Useful for audit
                      /preview, or when you'll launch the bundle manually.
@@ -109,7 +109,7 @@ setup.sh — install mac-vnc-stream from this git checkout.
                           within ~30s. Useful for fully-unattended installs;
                           loses the "probe confirms grants applied" feedback.
 
-Reads MVS_HEADLESS, MACOS_PASS, MVS_PASSWORD from env if unset.
+Reads MACSCREENCAST_HEADLESS, MACOS_PASS, MACSCREENCAST_PASSWORD from env if unset.
 
 Headless defaults: --headless implies opinionated cloud-Mac defaults so
 unattended installs don't get stuck:
@@ -129,7 +129,7 @@ above to bypass.
 Privileged-action policy: before every sudo command setup.sh announces what
 it's about to do (e.g. "Installing bundle to /Applications/ — requires sudo").
 You can Ctrl+C to abort at any point. The only actions that need root are
-(1) writing /Applications/mac-vnc-stream.app and (2) reading the MDM profile
+(1) writing /Applications/macscreencast.app and (2) reading the MDM profile
 list for the informational TCC-policy detection.
 HELP
             exit 0 ;;
@@ -194,20 +194,50 @@ if [[ "$HEADLESS" -eq 1 ]]; then
     NO_BOOTSTRAP_WAIT=1                                      # no human to press Enter
 fi
 
-step "mac-vnc-stream installer"
+step "macscreencast installer"
 echo "  Repo:    $REPO_DIR"
 echo "  User:    $MACOS_USER"
 echo "  Headless: $([[ $HEADLESS -eq 1 ]] && echo yes || echo no)"
 
+# ── Legacy cleanup: pre-rename install (com.macvncstream.server) ──────────────
+# The project was renamed mac-vnc-stream → macscreencast on 2026-05-05. Anyone
+# who installed the previous version has artifacts under the old bundle id;
+# clean them up so the new install doesn't fight an old LaunchAgent on :6081.
+LEGACY_LABEL="com.macvncstream.server"
+LEGACY_APP="/Applications/mac-vnc-stream.app"
+LEGACY_PLIST_USER="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
+LEGACY_PLIST_SYSTEM="/Library/LaunchDaemons/${LEGACY_LABEL}.plist"
+
+if [[ -d "$LEGACY_APP" ]] || [[ -f "$LEGACY_PLIST_USER" ]] || [[ -f "$LEGACY_PLIST_SYSTEM" ]]; then
+    yellow "  Detected legacy mac-vnc-stream install — cleaning up before continuing"
+    launchctl bootout "gui/$(id -u)/${LEGACY_LABEL}" 2>/dev/null || true
+    launchctl bootout "system/${LEGACY_LABEL}" 2>/dev/null || true
+    [[ -f "$LEGACY_PLIST_USER" ]] && rm -f "$LEGACY_PLIST_USER"
+    if [[ -f "$LEGACY_PLIST_SYSTEM" ]]; then
+        sudo rm -f "$LEGACY_PLIST_SYSTEM" 2>/dev/null || \
+            yellow "    (could not remove $LEGACY_PLIST_SYSTEM — sudo required, please remove manually)"
+    fi
+    [[ -d "$LEGACY_APP" ]] && {
+        sudo rm -rf "$LEGACY_APP" 2>/dev/null || \
+            yellow "    (could not remove $LEGACY_APP — sudo required, please remove manually)"
+    }
+    # Legacy TCC entries: harmless if left, but cleaner to drop them.
+    sudo tccutil reset ScreenCapture "$LEGACY_LABEL" 2>/dev/null || true
+    sudo tccutil reset Accessibility "$LEGACY_LABEL" 2>/dev/null || true
+    # Legacy PF anchor (cosmetic).
+    sudo pfctl -a com.macvncstream -F all 2>/dev/null || true
+    green "  Legacy install cleaned. Note: TCC permissions need to be re-granted to com.macscreencast.server"
+fi
+
 # ── Step 1: Detect macOS environment ──────────────────────────────────────────
 # TCC enforcement is mandatory on every modern macOS regardless of SIP state.
-# SIP-off does NOT disable TCC. The bundle path (com.macvncstream.server)
+# SIP-off does NOT disable TCC. The bundle path (com.macscreencast.server)
 # is the only reliable way to grant Screen Recording / Accessibility on
 # Sonoma+ and the only path that works at all on Tahoe (which refuses to
 # honor grants for interpreters like com.apple.python3). So we don't branch
 # on SIP — we always build and install the bundle.
 step "Detecting environment"
-green "  → will build .app bundle (com.macvncstream.server) so TCC tracks"
+green "  → will build .app bundle (com.macscreencast.server) so TCC tracks"
 green "    grants against this app, not the shared Python interpreter"
 
 # SSH-vs-local detection. Drives the VNC-fallback decision later: only
@@ -386,7 +416,7 @@ fi
 green "  Python: $PYTHON_BINARY"
 
 # ── Step 3: pip install dependencies (only when building from source) ────────
-# When a bundle already exists at /Applications/mac-vnc-stream.app AND
+# When a bundle already exists at /Applications/macscreencast.app AND
 # we're not forcing rebuild (--build-from-source), all the host-side pip
 # install is wasted: the .app contains its own bundled Python.framework
 # + every PyObjC framework + py2app. We just need to install the
@@ -400,7 +430,7 @@ green "  Python: $PYTHON_BINARY"
 # Lazy-install: if the user later picks [r]ebuild interactively, the
 # rebuild block (Step 8) re-enters this code path before invoking py2app.
 NEED_BUILD_DEPS=0
-if [[ ! -d "/Applications/mac-vnc-stream.app" ]] || [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
+if [[ ! -d "/Applications/macscreencast.app" ]] || [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
     NEED_BUILD_DEPS=1
 fi
 
@@ -442,15 +472,15 @@ if [[ "$NEED_BUILD_DEPS" -eq 1 ]]; then
     green "  Dependencies ready"
 else
     step "Skipping Python dependencies"
-    green "  Existing bundle found at /Applications/mac-vnc-stream.app —"
+    green "  Existing bundle found at /Applications/macscreencast.app —"
     green "  pip install not needed (deps live inside the .app)."
     green "  Will lazy-install if you later pick [r]ebuild."
 fi
 
 # ── Step 4: Web UI access token ───────────────────────────────────────────────
-if [[ -z "$MVS_PASSWORD" ]]; then
-    MVS_PASSWORD="$(${PYTHON_BINARY} -c 'import secrets; print(secrets.token_urlsafe(16))')"
-    green "  Generated web token: $MVS_PASSWORD"
+if [[ -z "$MACSCREENCAST_PASSWORD" ]]; then
+    MACSCREENCAST_PASSWORD="$(${PYTHON_BINARY} -c 'import secrets; print(secrets.token_urlsafe(16))')"
+    green "  Generated web token: $MACSCREENCAST_PASSWORD"
 fi
 
 # ── Authoritative TCC probe via TCC.db sudo query ────────────────────────────
@@ -473,7 +503,7 @@ tcc_probe() {
         echo "unknown"
         return 2
     fi
-    local _q="SELECT service, auth_value FROM access WHERE client='com.macvncstream.server' AND auth_value=2"
+    local _q="SELECT service, auth_value FROM access WHERE client='com.macscreencast.server' AND auth_value=2"
     local _sr=0 _ax=0
     # Query BOTH the system TCC.db and the per-user TCC.db. Apple's split
     # between the two has shifted across releases — Screen Recording is
@@ -520,16 +550,16 @@ tcc_probe() {
 # path: skip VNC entirely, just (re-)bootstrap the LaunchAgent.
 LAUNCHAGENT_BINARY=""
 APP_BUILT=""
-APP_DEST="/Applications/mac-vnc-stream.app"
+APP_DEST="/Applications/macscreencast.app"
 REBUILD_NEEDED=0
 TCC_GRANTED=0
 NEEDS_TCC_RESET=0
 # (SCREENSHARINGD_PRESENT and DID_WE_CHECKED_SCREENSHARINGD declared in env-detection step.)
 
 if [[ -d "$APP_DEST" ]]; then
-    if [[ -n "${MVS_PREBUILT_APP:-}" ]]; then
+    if [[ -n "${MACSCREENCAST_PREBUILT_APP:-}" ]]; then
         # install.sh's fast path: it already downloaded the latest release
-        # artifact AND replaced /Applications/mac-vnc-stream.app with it.
+        # artifact AND replaced /Applications/macscreencast.app with it.
         # The "keep / rebuild" prompt would be nonsensical here — there's
         # no source code on disk to rebuild from, and the bundle in
         # /Applications/ IS the just-downloaded latest. So we go straight
@@ -558,7 +588,7 @@ if [[ -d "$APP_DEST" ]]; then
     fi
     if [[ "$REBUILD_NEEDED" -eq 0 ]]; then
         APP_BUILT="$APP_DEST"
-        LAUNCHAGENT_BINARY="$APP_DEST/Contents/MacOS/mac-vnc-stream"
+        LAUNCHAGENT_BINARY="$APP_DEST/Contents/MacOS/macscreencast"
         # TCC probe (keep-path only — rebuild path leaves TCC_GRANTED=0
         # because new CDHash invalidates any prior grants by csreq
         # mismatch, no point probing). Override with --assume-tcc-granted
@@ -607,11 +637,11 @@ if [[ -d "$APP_DEST" ]]; then
                 ;;
         esac
 
-        # Auto-populate MACOS_PASS and MVS_PASSWORD from the existing plist
+        # Auto-populate MACOS_PASS and MACSCREENCAST_PASSWORD from the existing plist
         # on keep, so the user doesn't re-enter the macOS password each run,
         # AND the browser token doesn't churn between runs (which would
         # invalidate any open browser sessions).
-        # Note: MVS_PASSWORD was already generated as a fresh random token
+        # Note: MACSCREENCAST_PASSWORD was already generated as a fresh random token
         # in Step 4. We override it here on keep — existing plist's token
         # takes precedence so the user's open browser tabs keep working.
         # MACOS_PASS only auto-populates when the user didn't pass
@@ -640,12 +670,12 @@ import plistlib, sys
 try:
     with open(sys.argv[1], 'rb') as f:
         p = plistlib.load(f)
-    print(p.get('EnvironmentVariables', {}).get('MVS_PASSWORD', ''))
+    print(p.get('EnvironmentVariables', {}).get('MACSCREENCAST_PASSWORD', ''))
 except Exception:
     print('')
 " "$_existing_plist" 2>/dev/null || true)
             if [[ -n "$_existing_token" ]]; then
-                MVS_PASSWORD="$_existing_token"
+                MACSCREENCAST_PASSWORD="$_existing_token"
                 green "  Reusing browser token from existing plist (open sessions stay valid)"
             fi
             unset _existing_token
@@ -698,7 +728,7 @@ ensure_screensharingd() {
         # the latest state on next run.
         local _pf_already_locked=0
         if [[ -n "${MACOS_PASS:-}" ]] && [[ -f "$PF_ANCHOR_PATH" ]]; then
-            if echo "$MACOS_PASS" | sudo -S pfctl -a com.macvncstream -sr 2>/dev/null \
+            if echo "$MACOS_PASS" | sudo -S pfctl -a com.macscreencast -sr 2>/dev/null \
                     | grep -qE '5900'; then
                 _pf_already_locked=1
             fi
@@ -829,8 +859,8 @@ ensure_screensharingd() {
 # Our bundle's VNC bridge connects to 127.0.0.1:5900 anyway — losing nothing
 # functionally, removing the cloud-Mac brute-force attack surface.
 WANT_PF_LOCKDOWN=0
-PF_ANCHOR_PATH="/etc/pf.anchors/com.macvncstream"
-PF_CONF_MARKER="# anchor \"com.macvncstream\" -- mac-vnc-stream"
+PF_ANCHOR_PATH="/etc/pf.anchors/com.macscreencast"
+PF_CONF_MARKER="# anchor \"com.macscreencast\" -- macscreencast"
 apply_pf_lockdown_5900() {
     [[ "$WANT_PF_LOCKDOWN" -eq 1 ]] || return 0
     command -v pfctl >/dev/null 2>&1 || { yellow "  pfctl missing — skipping pf rule"; return 0; }
@@ -843,7 +873,7 @@ apply_pf_lockdown_5900() {
     local _expected_body
     _expected_body=$'pass in quick proto tcp from 127.0.0.0/8 to any port 5900\nblock in quick proto tcp from any to any port 5900'
     local _current_loaded
-    _current_loaded="$(echo "$MACOS_PASS" | sudo -S pfctl -a com.macvncstream -sr 2>/dev/null | grep -E '5900' || true)"
+    _current_loaded="$(echo "$MACOS_PASS" | sudo -S pfctl -a com.macscreencast -sr 2>/dev/null | grep -E '5900' || true)"
     if [[ -f "$PF_ANCHOR_PATH" ]] \
        && [[ "$(echo "$MACOS_PASS" | sudo -S cat "$PF_ANCHOR_PATH" 2>/dev/null)" == *"pass in quick"*"127.0.0.0/8"*"5900"* ]] \
        && [[ -n "$_current_loaded" ]]; then
@@ -867,8 +897,8 @@ apply_pf_lockdown_5900() {
         echo "$MACOS_PASS" | sudo -S tee -a /etc/pf.conf >/dev/null <<EOF
 
 ${PF_CONF_MARKER}
-anchor "com.macvncstream"
-load anchor "com.macvncstream" from "${PF_ANCHOR_PATH}"
+anchor "com.macscreencast"
+load anchor "com.macscreencast" from "${PF_ANCHOR_PATH}"
 EOF
     fi
     # pfctl -ef on macOS produces verbose stderr ("Use of -f option, could
@@ -877,10 +907,10 @@ EOF
     # loaded into our anchor instead of pattern-matching the noisy output.
     echo "$MACOS_PASS" | sudo -S pfctl -ef /etc/pf.conf >/dev/null 2>&1 || true
     sleep 1
-    if [[ -n "$(echo "$MACOS_PASS" | sudo -S pfctl -a com.macvncstream -sr 2>/dev/null | grep -E '5900' || true)" ]]; then
+    if [[ -n "$(echo "$MACOS_PASS" | sudo -S pfctl -a com.macscreencast -sr 2>/dev/null | grep -E '5900' || true)" ]]; then
         green "  pf rule installed — external :5900 now blocked, localhost still works"
     else
-        yellow "  pf rule didn't take — check 'sudo pfctl -a com.macvncstream -sr'."
+        yellow "  pf rule didn't take — check 'sudo pfctl -a com.macscreencast -sr'."
         yellow "  Anchor file remains at ${PF_ANCHOR_PATH} for manual inspection."
     fi
 }
@@ -1046,25 +1076,25 @@ if [[ "$REBUILD_NEEDED" -eq 1 ]]; then
         green "  Dependencies ready"
         NEED_BUILD_DEPS=1
     fi
-    step "Building .app bundle (com.macvncstream.server)"
+    step "Building .app bundle (com.macscreencast.server)"
     rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
     (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 | tail -10)
-    [[ -d "$REPO_DIR/dist/mac-vnc-stream.app" ]] \
-        || die "py2app did not produce dist/mac-vnc-stream.app"
+    [[ -d "$REPO_DIR/dist/macscreencast.app" ]] \
+        || die "py2app did not produce dist/macscreencast.app"
     echo
     yellow "  About to install bundle to /Applications/ — REQUIRES SUDO:"
     yellow "    sudo rm -rf $APP_DEST"
-    yellow "    sudo cp -R $REPO_DIR/dist/mac-vnc-stream.app $APP_DEST"
+    yellow "    sudo cp -R $REPO_DIR/dist/macscreencast.app $APP_DEST"
     if [[ -n "$MACOS_PASS" ]]; then
         echo "$MACOS_PASS" | sudo -S rm -rf "$APP_DEST" 2>/dev/null || true
-        echo "$MACOS_PASS" | sudo -S cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
+        echo "$MACOS_PASS" | sudo -S cp -R "$REPO_DIR/dist/macscreencast.app" "$APP_DEST"
     else
         sudo rm -rf "$APP_DEST" || true
-        sudo cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
+        sudo cp -R "$REPO_DIR/dist/macscreencast.app" "$APP_DEST"
     fi
     APP_BUILT="$APP_DEST"
-    LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/mac-vnc-stream"
-    green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
+    LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/macscreencast"
+    green "  Bundle installed at $APP_DEST (com.macscreencast.server, ad-hoc signed)"
     # Only mark TCC reset needed when there were entries to invalidate.
     # Fresh install (HAD_PRIOR_BUNDLE=0) → TCC.db has no rows for our bundle
     # id; tccutil reset would fail with -10814 ("No such bundle identifier").
@@ -1077,18 +1107,18 @@ fi
 # ── Step 9: tccutil reset if needed (rebuild OR stale-CDHash-on-keep) ────────
 if [[ "$NEEDS_TCC_RESET" -eq 1 ]]; then
     echo
-    yellow "  Resetting TCC for com.macvncstream.server (CDHash mismatch)..."
-    yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
-    yellow "    sudo tccutil reset Accessibility com.macvncstream.server"
+    yellow "  Resetting TCC for com.macscreencast.server (CDHash mismatch)..."
+    yellow "    sudo tccutil reset ScreenCapture com.macscreencast.server"
+    yellow "    sudo tccutil reset Accessibility com.macscreencast.server"
     # Tolerate non-zero exit: tccutil errors with -10814 when the bundle id
     # has no entries in TCC.db (e.g. user manually wiped them between runs).
     # Reset semantics in that case are already satisfied — nothing to clear.
     if [[ -n "$MACOS_PASS" ]]; then
-        echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1 || true
-        echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1 || true
+        echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macscreencast.server 2>&1 | head -1 || true
+        echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macscreencast.server 2>&1 | head -1 || true
     else
-        sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1 || true
-        sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1 || true
+        sudo tccutil reset ScreenCapture com.macscreencast.server 2>&1 | head -1 || true
+        sudo tccutil reset Accessibility com.macscreencast.server 2>&1 | head -1 || true
     fi
     green "  TCC reset — next toggle in Settings records current CDHash"
 fi
@@ -1123,7 +1153,7 @@ write_plist() {
     args+=(
         --listen "$LISTEN"
         --port "$PORT"
-        --password "$MVS_PASSWORD"
+        --password "$MACSCREENCAST_PASSWORD"
         --max-fps "$MAX_FPS"
         --codec "$CODEC"
     )
@@ -1134,7 +1164,7 @@ write_plist() {
 "; done
 
     local env_xml="        <key>MACOS_USER</key><string>${MACOS_USER}</string>
-        <key>MVS_PASSWORD</key><string>${MVS_PASSWORD}</string>
+        <key>MACSCREENCAST_PASSWORD</key><string>${MACSCREENCAST_PASSWORD}</string>
 "
     if [[ "$include_password" -eq 1 && -n "$MACOS_PASS" ]]; then
         env_xml+="        <key>MACOS_PASS</key><string>${MACOS_PASS}</string>
@@ -1199,15 +1229,15 @@ if [[ "$NO_LAUNCHAGENT" -eq 1 ]]; then
     green "  Or run the bundle directly:  $LAUNCHAGENT_BINARY"
     LOAD_DOMAIN=""
 else
-    step "Starting mac-vnc-stream service"
+    step "Starting macscreencast service"
     # Belt-and-suspenders cleanup: bootout the LaunchAgent if loaded, then
     # pkill any stray bundle processes (could be from a prior `open -a`,
     # direct binary launch, or a bootout that didn't fully tear down).
     # Without this, the new bootstrap can race with a stale process for
     # port 6081 and fail with EADDRINUSE.
     launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-    pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
-    pkill -9 -f "${REPO_DIR}/dist/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+    pkill -9 -f "/Applications/macscreencast.app/Contents/MacOS/macscreencast" 2>/dev/null || true
+    pkill -9 -f "${REPO_DIR}/dist/macscreencast.app/Contents/MacOS/macscreencast" 2>/dev/null || true
     sleep 2
 
     # Try the bootstrap. If it fails with rc=125 / "Domain does not support
@@ -1255,10 +1285,10 @@ else
             yellow "  Sharing once (creates gui/$(id -u)), re-run setup.sh for the"
             yellow "  persistent LaunchAgent install."
             # Pre-clear any lingering bundle process; otherwise port 6081 is busy.
-            pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+            pkill -9 -f "/Applications/macscreencast.app/Contents/MacOS/macscreencast" 2>/dev/null || true
             sleep 1
             nohup "$LAUNCHAGENT_BINARY" \
-                --listen "$LISTEN" --port "$PORT" --password "$MVS_PASSWORD" \
+                --listen "$LISTEN" --port "$PORT" --password "$MACSCREENCAST_PASSWORD" \
                 --max-fps "$MAX_FPS" --codec "$CODEC" \
                 --vnc-only \
                 --macos-user "$MACOS_USER" --macos-pass "$MACOS_PASS" \
@@ -1310,7 +1340,7 @@ fi
 # until they do — VNC stays available).
 if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0 && "${FOREGROUND_MODE:-0}" -eq 0 ]]; then
     MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
-    URL="http://localhost:${PORT}/?token=${MVS_PASSWORD}"
+    URL="http://localhost:${PORT}/?token=${MACSCREENCAST_PASSWORD}"
     if [[ "$LISTEN" == "127.0.0.1" ]]; then
         TUNNEL_HINT="  ssh -L ${PORT}:127.0.0.1:${PORT} ${MACOS_USER}@${MAC_IP}"
     else
@@ -1329,13 +1359,13 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     fi
     yellow "  │"
     yellow "  │  In System Settings ▸ Privacy & Security, you need TWO grants:"
-    yellow "  │    • Screen Recording → toggle ON for 'mac-vnc-stream'"
-    yellow "  │    • Accessibility    → toggle ON for 'mac-vnc-stream'"
+    yellow "  │    • Screen Recording → toggle ON for 'macscreencast'"
+    yellow "  │    • Accessibility    → toggle ON for 'macscreencast'"
     yellow "  │"
-    yellow "  │  ── If 'mac-vnc-stream' is in the list ──────────────────────────"
+    yellow "  │  ── If 'macscreencast' is in the list ──────────────────────────"
     yellow "  │  Just toggle it ON in each pane."
     yellow "  │"
-    yellow "  │  ── If 'mac-vnc-stream' is NOT in the list (Tahoe Screen "
+    yellow "  │  ── If 'macscreencast' is NOT in the list (Tahoe Screen "
     yellow "  │     Recording sometimes doesn't auto-register, even though"
     yellow "  │     Accessibility does) ───────────────────────────────────────"
     yellow "  │  1. Click '+' at the bottom-left of the pane."
@@ -1344,7 +1374,7 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     yellow "  │"
     yellow "  │       ${APP_BUILT}"
     yellow "  │"
-    yellow "  │  4. Toggle the new 'mac-vnc-stream' entry ON."
+    yellow "  │  4. Toggle the new 'macscreencast' entry ON."
     yellow "  │  5. Repeat for the other pane (Screen Recording AND Accessibility"
     yellow "  │     are TWO separate grants — both must be on)."
     yellow "  │"
@@ -1391,14 +1421,14 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
                 echo
                 yellow "  Not granted yet — TCC.db reports: ${_probe_state}"
                 yellow "  Open System Settings ▸ Privacy & Security and toggle BOTH:"
-                yellow "    • Screen Recording → 'mac-vnc-stream' ON"
-                yellow "    • Accessibility    → 'mac-vnc-stream' ON"
+                yellow "    • Screen Recording → 'macscreencast' ON"
+                yellow "    • Accessibility    → 'macscreencast' ON"
                 yellow "  IMPORTANT: Tahoe sometimes shows the toggle going ON then"
                 yellow "  silently reverts it to OFF if you skip the password prompt."
                 yellow "  Make sure Tahoe asks for your password and you actually enter it."
                 yellow "  Then Cmd+Q the Settings app — Tahoe occasionally only commits"
                 yellow "  the auth_value=2 row when Settings quits."
-                yellow "  If 'mac-vnc-stream' isn't in the pane, click '+', Cmd+Shift+G:"
+                yellow "  If 'macscreencast' isn't in the pane, click '+', Cmd+Shift+G:"
                 yellow "    ${APP_BUILT}"
                 yellow "  Then come back here and press Enter again. Or Ctrl+C to leave"
                 yellow "  the bundle running in bootstrap (VNC) mode and finish later."
@@ -1437,7 +1467,7 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
                     echo
                     yellow "  Two ways forward:"
                     yellow "  (a) Press Ctrl+C to leave the bundle running in bootstrap mode."
-                    yellow "      Bundle is at /Applications/mac-vnc-stream.app and serves VNC."
+                    yellow "      Bundle is at /Applications/macscreencast.app and serves VNC."
                     yellow "      Once you grant in System Settings, the running server's"
                     yellow "      30s auto-upgrade loop picks SCK up automatically — no need"
                     yellow "      for setup.sh to verify the transition."
@@ -1481,7 +1511,7 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     # even though the plist on disk no longer has them. bootout + bootstrap
     # forces launchd to re-parse the plist from disk.
     launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-    pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+    pkill -9 -f "/Applications/macscreencast.app/Contents/MacOS/macscreencast" 2>/dev/null || true
     sleep 2
     launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1 | head -2
     sleep 4
@@ -1506,14 +1536,14 @@ if [[ "${FOREGROUND_MODE:-0}" -eq 1 ]]; then
     yellow "  │  Bundle is running as a regular process (not a LaunchAgent),     │"
     yellow "  │  in VNC-bridge mode. Open the URL in your browser via SSH tunnel │"
     yellow "  │  to see the desktop, then grant Screen Recording + Accessibility │"
-    yellow "  │  for 'mac-vnc-stream' in System Settings ▸ Privacy & Security.   │"
+    yellow "  │  for 'macscreencast' in System Settings ▸ Privacy & Security.   │"
     yellow "  │                                                                    │"
     yellow "  │  After granting, re-run install.sh / setup.sh — it'll attempt    │"
     yellow "  │  the LaunchAgent install for persistence across reboots and      │"
     yellow "  │  enable 60fps SCK capture (full-quality remote desktop).         │"
     yellow "  │                                                                    │"
     yellow "  │  This foreground process dies if the SSH session ends or the Mac │"
-    yellow "  │  reboots. To stop it manually: pkill -f mac-vnc-stream           │"
+    yellow "  │  reboots. To stop it manually: pkill -f macscreencast           │"
     yellow "  └────────────────────────────────────────────────────────────────────┘"
     echo
 fi
@@ -1549,15 +1579,15 @@ TCC_OK=0
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-green "  mac-vnc-stream is running"
+green "  macscreencast is running"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
 if [[ "$LISTEN" == "127.0.0.1" ]]; then
     echo "  Access via SSH tunnel (server is loopback-only):"
     echo "    ssh -L ${PORT}:127.0.0.1:${PORT} ${MACOS_USER}@${MAC_IP}"
-    echo "    then open: http://127.0.0.1:${PORT}/?token=${MVS_PASSWORD}"
+    echo "    then open: http://127.0.0.1:${PORT}/?token=${MACSCREENCAST_PASSWORD}"
 else
-    echo "  Direct: http://${MAC_IP}:${PORT}/?token=${MVS_PASSWORD}"
+    echo "  Direct: http://${MAC_IP}:${PORT}/?token=${MACSCREENCAST_PASSWORD}"
 fi
 echo
 
@@ -1595,8 +1625,8 @@ else
 fi
 if [[ "$ACTUAL_MODE" != "sck" ]]; then
     yellow "  ┌─ Grant permissions in System Settings ▸ Privacy & Security ──────┐"
-    yellow "  │  • Screen Recording  → toggle ON for 'mac-vnc-stream'             │"
-    yellow "  │  • Accessibility     → toggle ON for 'mac-vnc-stream'             │"
+    yellow "  │  • Screen Recording  → toggle ON for 'macscreencast'             │"
+    yellow "  │  • Accessibility     → toggle ON for 'macscreencast'             │"
     yellow "  │                                                                    │"
     yellow "  │  The app should already be in both lists (we ran a TCC probe).    │"
     yellow "  │  If it isn't, click '+', press Cmd+Shift+G in the file picker,    │"
@@ -1657,7 +1687,7 @@ fi
 echo
 echo "  Log:    tail -f $LOG_PATH"
 if [[ "${FOREGROUND_MODE:-0}" -eq 1 ]]; then
-    echo "  Restart: pkill -f mac-vnc-stream && bash setup.sh"
+    echo "  Restart: pkill -f macscreencast && bash setup.sh"
 else
     echo "  Restart: launchctl kickstart -k ${LOAD_DOMAIN}/${LABEL}"
 fi

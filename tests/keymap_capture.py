@@ -33,7 +33,7 @@ def main():
     import objc as _objc
 
     with open(LOG, 'w') as f:
-        f.write('# mac-vnc-stream key logger started ' + datetime.datetime.now().isoformat() + '\n')
+        f.write('# macscreencast key logger started ' + datetime.datetime.now().isoformat() + '\n')
         f.write('# columns: type  kc=keycode  mods=modifiers  chars=chars_with_mods  raw=chars_ignoring_mods\n')
     print('Logging to', LOG)
 
@@ -113,7 +113,7 @@ def main():
     tv.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12, 0))
     tv.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable)
     tv.setString_(
-        'KEY LOGGER — mac-vnc-stream keyboard test\n\n'
+        'KEY LOGGER — macscreencast keyboard test\n\n'
         '1. Click anywhere in this window in the web UI to give it focus.\n'
         '2. Run:  python3 test_keys.py   (from another SSH session)\n'
         '3. Review results in /tmp/keylog.txt\n\n'

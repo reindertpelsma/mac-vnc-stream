@@ -1,4 +1,4 @@
-# mac-vnc-stream — agent notes
+# macscreencast — agent notes
 
 This file is for future agents (and humans) working on the codec / rate-control
 stack. The Apple VideoToolbox behavior here is non-obvious and we burned several
@@ -6,7 +6,7 @@ iterations on it; this is the cliff notes so nobody repeats them.
 
 ## What this project is (one-paragraph orientation)
 
-**mac-vnc-stream is a browser-based macOS remote desktop at up to 60fps,
+**macscreencast is a browser-based macOS remote desktop at up to 60fps,
 delivered over an SSH tunnel with no third-party relay.** The Python server
 runs on a Mac and exposes a WebSocket on `127.0.0.1:6081`; the user opens
 `http://localhost:6081/?token=…` after `ssh -L 6081:localhost:6081`. Frames are
@@ -236,7 +236,7 @@ The responsive/buffer split + the fps hard-cap + the wb-aware drain were
 all stress-tested end-to-end through the worst geometry we could build
 with what's lying around: Safari on a Scaleway mac mini M2 (Paris) →
 SSH-tunnelled to a relay VPS → SSH-tunnelled to a `macos-latest` GH
-Actions runner running mac-vnc-stream. Three TCP hops, WebSocket on top.
+Actions runner running macscreencast. Three TCP hops, WebSocket on top.
 
 Numbers observed (responsive mode, fps cap = 20, max BW = 2 Mbps):
 
@@ -289,7 +289,7 @@ work" benchmark when changing rate-control or pacing logic.
 Validate in this order, do not skip steps:
 
 1. **Local Mac mini live**: SSH `m1@62.210.195.81`, deploy, restart
-   service, watch `tail -f /tmp/macvncstream.log`. Test in real Chrome
+   service, watch `tail -f /tmp/macscreencast.log`. Test in real Chrome
    with DevTools 2Mbps throttle. CI does NOT catch real-TCP-backpressure
    bugs.
 2. **GH CI**: covers the virtual-clock test (no real backpressure) and
@@ -307,5 +307,5 @@ Real-browser smoke is irreplaceable.
 ## Test host
 
 `m1@62.210.195.81` (sudo password in private notes / ask owner). macOS
-Tahoe 26.x on M1. Server lives at `~/mac-vnc-stream/`, autorestarts via
-LaunchAgent `com.macvncstream.server`. Log at `/tmp/macvncstream.log`.
+Tahoe 26.x on M1. Server lives at `~/macscreencast/`, autorestarts via
+LaunchAgent `com.macscreencast.server`. Log at `/tmp/macscreencast.log`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ci_smoke.py — non-interactive CI smoke test for mac-vnc-stream.
+"""ci_smoke.py — non-interactive CI smoke test for macscreencast.
 
 Tests:
   1. SCK video: connect WebSocket, send caps, assert >= MIN_FRAMES in 8s
@@ -141,7 +141,7 @@ async def test_audio():
         failures.append(msg)
 
 async def main():
-    print(f"mac-vnc-stream CI smoke test — {HOST}:{PORT}")
+    print(f"macscreencast CI smoke test — {HOST}:{PORT}")
     print()
     _cpu.start()
     try:

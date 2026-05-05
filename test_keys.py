@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_keys.py — keyboard shortcut verification via mac-vnc-stream WebSocket.
+"""test_keys.py — keyboard shortcut verification via macscreencast WebSocket.
 
 Run from the Mac (port 6081 is loopback-only):
   python3 test_keys.py

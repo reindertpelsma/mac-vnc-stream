@@ -4,7 +4,7 @@
 
 ## What this is
 
-mac-vnc-stream is a single-author project. First public commit was 2026-05-01;
+macscreencast is a single-author project. First public commit was 2026-05-01;
 ~140 commits as of this writing. It is in active daily development by one
 person (Reindert Pelsma). There has been no external community review yet,
 no external contributors, and no security audit.
@@ -58,6 +58,6 @@ those two files plus the commit history are the handover.
 
 ## How to help / report issues
 
-GitHub Issues on `reindertpelsma/mac-vnc-stream`. Useful bug reports include
-the relevant section of `/tmp/macvncstream.log` and what you saw in the
+GitHub Issues on `reindertpelsma/macscreencast`. Useful bug reports include
+the relevant section of `/tmp/macscreencast.log` and what you saw in the
 browser's DevTools console.

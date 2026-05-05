@@ -11,7 +11,7 @@ All flags can be set via CLI or environment variable.
 | `--port` | `PORT` | `6081` | HTTP/WebSocket port |
 | `--max-fps` | `MAX_FPS` | `60` | Maximum fps |
 | `--codec` | `CODEC` | `h264` | `h264`, `h265`, or `jpeg` |
-| `--password` | `MVS_PASSWORD` | *(none)* | Web UI access token (`?token=...`) |
+| `--password` | `MACSCREENCAST_PASSWORD` | *(none)* | Web UI access token (`?token=...`) |
 | `--capture` | `CAPTURE_MODE` | `auto` | `auto` (SCK→VNC fallback), `sck`, `vnc` |
 | `--input` | `INPUT_MODE` | `auto` | `auto` (CGEvent→VNC fallback), `cgevent`, `vnc` |
 | `--vnc-only` | — | — | Force VNC for both capture and input |
@@ -71,9 +71,9 @@ The server is designed to run unattended without manual restarts.
 ## Uninstalling
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.macvncstream.server" 2>/dev/null || \
-  sudo launchctl bootout system/com.macvncstream.server
-sudo rm -f /Library/LaunchDaemons/com.macvncstream.server.plist
-rm ~/Library/LaunchAgents/com.macvncstream.server.plist
-rm -rf ~/mac-vnc-stream
+launchctl bootout "gui/$(id -u)/com.macscreencast.server" 2>/dev/null || \
+  sudo launchctl bootout system/com.macscreencast.server
+sudo rm -f /Library/LaunchDaemons/com.macscreencast.server.plist
+rm ~/Library/LaunchAgents/com.macscreencast.server.plist
+rm -rf ~/macscreencast
 ```
