@@ -40,3 +40,9 @@ On Tahoe, a Mac that has never had a console login refuses to create a `gui/$UID
 `setup.sh` detects this and falls back to **foreground `--vnc-only` mode**: the bundle runs as a child of the install shell, in the user's session domain (which exists), with VNC capture only. You get a working server immediately — and crucially, that server itself exposes the macOS desktop in your browser, so you can **log in to the loginwindow through the very web UI mac-vnc-stream just gave you**. That single login creates the `gui/$UID` Aqua session. Re-run `setup.sh` and it bootstraps the persistent LaunchAgent + auto-upgrade path normally.
 
 That's why the fallback is neat: no separate VNC client, no Apple Screen Sharing.app from another Mac, no hardware KVM-over-IP needed. The bootstrap server is also the bootstrap client. The only cost is one re-run of `setup.sh` after the first console login, and the foreground server doesn't survive the SSH session ending.
+
+### Cosmetic "py2app failed" pop-ups during VNC bootstrap
+
+While you're on the VNC fallback path, you may see macOS pop-up alerts saying things like *"Launch failed — see py2app website"* or that a helper subprocess crashed. **These are cosmetic and safe to ignore.** They come from macOS itself reporting that auxiliary helper processes (e.g. the compositor keepalive) couldn't be launched into the missing `gui/$UID` domain — exactly the situation the foreground fallback exists to handle.
+
+The .app bundle is still in early-maturity probing for the various edge cases in py2app's launcher under cloud-Mac conditions. Once you complete the first console login and re-run `setup.sh`, the persistent LaunchAgent path runs in the proper user/Aqua domain and the alerts stop.
