@@ -141,7 +141,7 @@ if [[ "$FORCE_BUILD_FROM_SOURCE" -eq 0 ]]; then
             green "  Keeping existing bundle — skipping download (~53 MB saved)"
         else
             yellow "  Downloading..."
-            TMP_DIR="$(mktemp -d /tmp/mvs.XXXXXX)"
+            TMP_DIR="$(mktemp -d /tmp/macscreencast.XXXXXX)"
             TMP_TAR="$TMP_DIR/$ASSET_NAME"
             if ! curl -fsSL "$ASSET_URL" -o "$TMP_TAR"; then
                 yellow "  Download failed — falling through to from-source install"
@@ -179,7 +179,7 @@ if [[ "$FORCE_BUILD_FROM_SOURCE" -eq 0 ]]; then
             # than `main`. Tag content is immutable so CDN caching is
             # guaranteed-correct, and setup.sh is in-sync with the bundle
             # artifact's expectations.
-            SETUP_TMP="$(mktemp -d /tmp/mvs-setup.XXXXXX)"
+            SETUP_TMP="$(mktemp -d /tmp/macscreencast-setup.XXXXXX)"
             curl -fsSL "$REPO_URL/raw/${RELEASE_TAG}/setup.sh" -o "$SETUP_TMP/setup.sh" \
                 || die "failed to fetch setup.sh from ${RELEASE_TAG}"
             chmod +x "$SETUP_TMP/setup.sh"
