@@ -309,7 +309,10 @@ class AdaptiveController:
                 step_ceil = max(self.bitrate * 2, self.bitrate + 500_000)
                 self.bitrate = max(self._min_br, min(target, step_ceil))
                 self.jpeg_quality = min(95, self.jpeg_quality + 20)
-            self._last_fast = time.monotonic()
+                # Only debounce on_fresh when we actually jump bitrate — unconditional
+                # _last_fast updates block the 2s fallback ramp in on_fresh() when
+                # there are no client clear signals (background tab / no lag reports).
+                self._last_fast = time.monotonic()
             log.debug("screen active: fps=%.1f br=%dk ceil=%dk", self.fps, self.bitrate//1000, self._ceil_bitrate//1000)
 
     def snapshot(self):
