@@ -155,6 +155,20 @@ class AdaptiveController:
 
     def on_lag(self, age_ms, write_buf=0):
         budget = self.lag_budget_ms()
+        # write_buf == 0: the local TCP socket was empty when the frame was queued —
+        # no backpressure from the link.  In this state age_ms reflects frame
+        # transmission time + base network latency, not sustained congestion.
+        # Apple VideoToolbox I-frames can still spike age on high-RTT links.
+        # The ping-gradient signal handles sustained RTT rises; write_buf handles
+        # actual TCP backpressure.  Suppress age-only backoff when wb == 0.
+        if write_buf == 0:
+            if age_ms > 0 and age_ms < budget:
+                with self._lock:
+                    self._last_clear_t = time.monotonic()
+            else:
+                log.debug("on_lag: age=%.0fms wb=0 budget=%.0fms — I-frame spike / base latency, no backoff",
+                          age_ms, budget)
+            return
         if age_ms > 0 and age_ms < budget and write_buf < self.lag_wb_budget():
             return
         if age_ms == 0 and write_buf < self.lag_wb_budget():
