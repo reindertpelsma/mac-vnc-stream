@@ -360,7 +360,10 @@ class VNCBridge:
                 self._fb_hash = new_hash
                 self._fb_seq += 1
                 self._fb_ms = int(time.time() * 1000)
-                self._cg_override_until = self._fb_ms + 2000
+                # 5s window: poller runs every 2s and takes ~200ms on M1, so a
+                # 2s window was too tight — stale VNC frames could slip through
+                # in the ~200ms gap before the next poll armed the window again.
+                self._cg_override_until = self._fb_ms + 5000
             return True
         except Exception as e:
             log.debug("cg_direct_capture failed: %s", e)
@@ -632,6 +635,61 @@ class VNCBridge:
             except Exception:
                 pass
 
+    def _screencapture_poller(self):
+        """Poll the screen via screencapture -x every 2s when VNC content is stale.
+
+        screensharingd enters an HID-idle mode after ~5s of no user input where
+        it keeps responding to FramebufferUpdateRequests but returns the same stale
+        pixels each time (the hash never changes). The existing cg_direct_capture
+        path handles the keypress-triggered case (fires 150ms post-keypress), but
+        a viewer watching a terminal or video stream gets a frozen picture until
+        the 90s watchdog fires and restarts screensharingd (~3s disruption).
+
+        This thread runs a lightweight screencapture -x every 2s whenever the
+        framebuffer has been stale for more than 3s and at least one browser client
+        is connected. screencapture bypasses screensharingd entirely and always
+        returns the correctly composited scene. Takes ~150-250ms on M1 so we sleep
+        2s between runs; at worst the viewer sees a 2-3s refresh cadence on an idle
+        screen, which is far better than 90s of frozen desktop.
+
+        When screencapture confirms the screen is unchanged (same hash as current
+        framebuffer), the _cg_override_until window is extended to prevent VNC from
+        overwriting the correct framebuffer with pre-screencapture stale data on the
+        next FBU. Without this extension, the 2s override window can expire between
+        polls and allow the stale VNC frame to overwrite a good screencapture frame."""
+        while True:
+            time.sleep(2)
+            try:
+                if _handler_mod._active_clients == 0:
+                    continue
+                with self._lock:
+                    if self._fb is None:
+                        continue
+                    stale_ms = int(time.time() * 1000) - self._fb_ms
+                    W, H = self._W, self._H
+                # Only kick in when VNC content has been stale for >3s.
+                # Fresh screens (active terminal, video, etc.) update via VNC
+                # at full speed and don't need this overhead.
+                if stale_ms < 3000:
+                    continue
+                updated = self._cg_direct_capture(W, H)
+                if not updated:
+                    # Screen unchanged since last poll — our current framebuffer
+                    # content matches reality. Extend the VNC override window so
+                    # stale VNC frames from screensharingd's HID-idle path can't
+                    # overwrite it in the gap between polls. Only extend if the
+                    # override was already armed (meaning we've already confirmed
+                    # that screencapture and VNC disagree — see Scenario C above).
+                    with self._lock:
+                        if self._cg_override_until > 0:
+                            self._cg_override_until = int(time.time() * 1000) + 4000
+                        elif self._stale_vnc_hash != 0 and self._stale_vnc_hash != self._fb_hash:
+                            # VNC's known stale hash still differs from what screencapture
+                            # confirmed. Re-arm the override window to protect good content.
+                            self._cg_override_until = int(time.time() * 1000) + 4000
+            except Exception as e:
+                log.debug("screencapture poller: %s", e)
+
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         threading.Thread(target=self._pbpaste_poll, daemon=True).start()
@@ -639,6 +697,8 @@ class VNCBridge:
                          daemon=True, name="ssd-pid-watcher").start()
         threading.Thread(target=self._vnc_keepwarm,
                          daemon=True, name="vnc-keepwarm").start()
+        threading.Thread(target=self._screencapture_poller,
+                         daemon=True, name="screencapture-poller").start()
 
     def _vnc_keepwarm(self):
         """Send a no-op VNC pointer move every 25s to keep screensharingd's
